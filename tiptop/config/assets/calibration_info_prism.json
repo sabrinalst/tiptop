@@ -1,14 +1,14 @@
 {
   "254622075770": {
     "pose": [
-      0.39,
-      -0.055,
-      0.9300,
-      -2.9670597283903604,
-      0.0,
-      -1.5707963267948966
+      0.23467910563048622,
+      -0.005048929395446683,
+      0.9537294084578093,
+      -2.6418332288458624,
+      -0.020462544460128518,
+      -1.5825975316103766
     ],
-    "timestamp": 1785706584.496672,
-    "source": "sim design pose (droid-sim-evals bimanual_yam.top_camera_cfg) \u2014 NOT a measurement"
+    "timestamp": 1786551265.423536,
+    "source": "raiden charuco calibration (~/.config/raiden/calibration_results.json, 2026-08-11T12:14:25) — left_arm_base extrinsics shifted by the URDF world->left_arm offset (0.24, 0.24, 0.0551)"
   }
 }

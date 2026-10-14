@@ -82,7 +82,7 @@ cameras:
     mount: world
 
   external:
-    serial: "${oc.env:TIPTOP_LEFT_WRIST_CAMERA_ID,353322270876}"
+    serial: "${oc.env:TIPTOP_LEFT_WRIST_CAMERA_ID,218622279640}"
     type: realsense
     width: 640
     height: 360
