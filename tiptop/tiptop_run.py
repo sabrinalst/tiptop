@@ -29,6 +29,7 @@ from cutamp.utils.rerun_utils import log_curobo_mesh_to_rerun
 from jaxtyping import Bool, Float
 from scipy.spatial import KDTree
 
+from tiptop.chosen_grasp import save_chosen_grasps
 from tiptop.config import as_robot_type as _as_robot_type
 from tiptop.config import load_calibration, tiptop_cfg
 from tiptop.execute_plan import execute_cutamp_dual_plan, execute_cutamp_plan
@@ -97,7 +98,7 @@ from tiptop.yam.capture import (
     segments_from_dual_plan,
     segments_from_plan,
 )
-from tiptop.yam.task_split import arm_goal_builder, handover_goal_builder
+from tiptop.yam.task_split import arm_goal_builder, handover_goal_builder, parallel_goal_builder
 from tiptop.yam.yam_client import GRIPPER_STROKE_M as YAM_GRIPPER_STROKE_M
 
 _log = logging.getLogger(__name__)
@@ -506,7 +507,7 @@ def _run_robot_command(container, cfg, cmd: str) -> None:
     """
     try:
         arms = configured_arms()
-        dual_handover = cfg.robot.type == "bimanual_yam_dual"
+        dual_arm = cfg.robot.type == "bimanual_yam_dual"
         if cmd == "home":
             if arms:
                 # Every configured arm, through cuRobo. This is the documented recovery after an
@@ -514,7 +515,7 @@ def _run_robot_command(container, cfg, cmd: str) -> None:
                 # that makes the other arm's plans untrustworthy (see _assert_idle_arm_parked).
                 _log.info(f"Manual command: returning arms {arms} home")
                 home_all_arms(container)
-            elif dual_handover:
+            elif dual_arm:
                 _log.info("Manual command: returning both arms home (dual)")
                 go_to_dual_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
             else:
@@ -526,7 +527,7 @@ def _run_robot_command(container, cfg, cmd: str) -> None:
                 for arm in arms:
                     with active_arm(arm):
                         _open_gripper_if_needed(container)
-            elif dual_handover:
+            elif dual_arm:
                 for arm in ("left", "right"):
                     _open_gripper_if_needed(container, arm=arm)
             else:
@@ -1338,7 +1339,10 @@ async def _run_one_arm(
 
     plan_path = save_dir / f"tiptop_plan_{arm}.json"
     trace_cfg = resolve_trace_cfg(container.cost_overrides)
-    save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg), plan_path)
+    serialized_plan = serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg)
+    save_tiptop_plan(serialized_plan, plan_path)
+    # Into the ARM's directory, next to the grasp candidates and point cloud it was chosen from.
+    save_chosen_grasps(arm_dir, serialized_plan, env, processed_scene.grasps, tiptop_cfg().robot.type)
 
     _log.info(f"{arm} arm: executing plan ({len(cutamp_plan)} steps)")
     timeline: list[dict] = []
@@ -1446,28 +1450,36 @@ async def _run_yam_dual_rollout(
     save_dir: Path,
     task_instruction: str,
 ) -> dict:
-    """One SIMULTANEOUS dual-arm handover episode: one perceive-plan-execute cycle against the
-    12-DOF ``bimanual_yam_dual`` embodiment.
+    """One SIMULTANEOUS dual-arm episode: one perceive-plan-execute cycle against the 12-DOF
+    ``bimanual_yam_dual`` embodiment.
 
     Unlike :func:`_run_yam_rollout`, this is NOT a per-arm loop: cuTAMP plans and collision-checks
     both hands inside one 12-DOF configuration directly (see ``bimanual_yam_dual.yml``'s
     self-collision spheres and ``DualKinematicConstraint``), so there is no "arm that isn't planning
     is a locked obstacle" step and no need to re-perceive between arms — one perception pass and one
-    cuTAMP call cover the whole episode. :func:`tiptop.yam.task_split.handover_goal_builder` narrows
-    the grounded goal to the single atom that actually needs a handover (v1: at most one per
-    episode, a domain constraint of ``handover_tamp_operators``, not a simplification).
+    cuTAMP call cover the whole episode.
+
+    ``robot.dual_task`` picks the operator list, and with it the goal builder — the two are one
+    choice, not two: ``handover`` (``handover_tamp_operators``) can plan exactly one goal atom, the
+    one that needs both hands, so it uses
+    :func:`tiptop.yam.task_split.handover_goal_builder`; ``parallel`` (``dual_tamp_operators``, the
+    lockstep PickBoth/PlaceBoth pair) plans exactly two, one per hand, via
+    :func:`tiptop.yam.task_split.parallel_goal_builder`. Both are domain constraints of the operator
+    list, not simplifications to relax later.
     """
     cfg = tiptop_cfg()
     tdf = cfg.robot.time_dilation_factor
     base_y = float(cfg.robot.get("base_y", 0.0))
-    _log.info(f"Dual-arm rollout: handover objects split at y = {base_y}")
+    dual_task = str(cfg.robot.get("dual_task", "parallel"))
+    goal_builder = handover_goal_builder(base_y) if dual_task == "handover" else parallel_goal_builder(base_y)
+    _log.info(f"Dual-arm rollout ({dual_task}): midline at y = {base_y}")
 
     cameras_to_record, lerobot_cameras = _yam_recording_targets(container, save_dir)
     if not cameras_to_record:
         raise RuntimeError("no cameras configured to record; check the `cameras` block of the config")
 
     segments: list = []
-    meta: dict = {"arm": "dual"}
+    meta: dict = {"arm": "dual", "dual_task": dual_task}
     plan_path = None
 
     with BimanualJointSampler(
@@ -1517,7 +1529,7 @@ async def _run_yam_dual_rollout(
                 save_dir,
                 depth_estimator=container.depth_estimator,
                 gripper_mask=container.gripper_mask,
-                goal_builder=handover_goal_builder(base_y),
+                goal_builder=goal_builder,
             )
             meta["perception_duration"] = time.perf_counter() - perception_start
             meta["grounded_atoms"] = grounded_atoms
@@ -1526,7 +1538,7 @@ async def _run_yam_dual_rollout(
             save_run_outputs(save_dir, env, processed_scene.grasps)
 
             if grounded_atoms:
-                _log.info(f"dual: planning handover for {[a['args'] for a in grounded_atoms]}")
+                _log.info(f"dual ({dual_task}): planning {[a['args'] for a in grounded_atoms]}")
                 cutamp_plan, planning_duration, failure_reason = run_planning(
                     env,
                     container.tamp_config,
@@ -1548,7 +1560,11 @@ async def _run_yam_dual_rollout(
                 else:
                     plan_path = save_dir / "tiptop_plan.json"
                     trace_cfg = resolve_trace_cfg(container.cost_overrides)
-                    save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg), plan_path)
+                    serialized_plan = serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg)
+                    save_tiptop_plan(serialized_plan, plan_path)
+                    save_chosen_grasps(
+                        save_dir, serialized_plan, env, processed_scene.grasps, tiptop_cfg().robot.type
+                    )
 
                     _log.info(f"dual: executing plan ({len(cutamp_plan)} steps)")
                     timeline: list[dict] = []
@@ -1569,7 +1585,7 @@ async def _run_yam_dual_rollout(
                         )
                     meta["status"] = "executed"
             else:
-                _log.info("dual: nothing needs a handover this episode; skipping")
+                _log.info(f"dual ({dual_task}): no plannable goal this episode; skipping")
                 meta["status"] = "nothing_to_do"
 
     n_frames = 0
@@ -1750,7 +1766,9 @@ async def _run_scene_reset(
         if cutamp_plan is None:
             raise RuntimeError(f"cuTAMP found no reset plan for any of {sorted(skipped)}")
         plan_path = save_dir / "tiptop_plan.json"
-        save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init), plan_path)
+        serialized_plan = serialize_plan(cutamp_plan, observation.q_init)
+        save_tiptop_plan(serialized_plan, plan_path)
+        save_chosen_grasps(save_dir, serialized_plan, env, processed_scene.grasps, tiptop_cfg().robot.type)
 
         _log.info(f"Executing scene reset ({len(moved)} object(s) back to the table: {moved})")
         # A reset executes like a rollout, so it records like one: cameras + measured state land in
@@ -1806,11 +1824,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
     cfg = tiptop_cfg()
     arms = configured_arms()
     bimanual = bool(arms)
-    dual_handover = cfg.robot.type == "bimanual_yam_dual"
+    dual_arm = cfg.robot.type == "bimanual_yam_dual"
     if bimanual:
         _log.info(f"Bimanual YAM session: arms {arms} (sequential — one cuTAMP plan per arm per episode)")
-    elif dual_handover:
-        _log.info("Dual-arm YAM session: bimanual_yam_dual (simultaneous — one cuTAMP plan per episode)")
+    elif dual_arm:
+        _log.info(
+            f"Dual-arm YAM session: bimanual_yam_dual, dual_task={cfg.robot.get('dual_task', 'parallel')} "
+            "(simultaneous — one cuTAMP plan per episode)"
+        )
 
     # Force TCP handshake for every request
     connector = aiohttp.TCPConnector(limit=10, force_close=True)
@@ -1829,14 +1850,15 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # nudges; 'reset' is a whole unrecorded perceive-plan-execute cycle, hence async.
                 if task_instruction in ROBOT_COMMANDS:
                     if task_instruction == "reset":
-                        if dual_handover:
+                        if dual_arm:
                             # build_reset_goal/_plan_largest_solvable_reset assume a single-arm
-                            # pick-and-place domain; handover_tamp_operators has no general
-                            # Pick/Place to reset an arbitrary scene with. Refuse loudly rather than
-                            # let this hit arm_of("dual") deep inside the single-arm reset path.
+                            # pick-and-place domain; neither dual operator list has a general
+                            # Pick/Place to reset an arbitrary scene with (the lockstep one can only
+                            # move objects in pairs). Refuse loudly rather than let this hit
+                            # arm_of("dual") deep inside the single-arm reset path.
                             _log.error(
                                 "'reset' is not supported for bimanual_yam_dual yet -- move the "
-                                "object(s) back by hand between handover episodes."
+                                "object(s) back by hand between dual-arm episodes."
                             )
                             _emit_event({
                                 "event": "reset_failed", "dir": "", "error": "unsupported in dual mode",
@@ -1866,7 +1888,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                 _open_gripper_if_needed(container)
                             except Exception as _e:
                                 _log.exception(f"Gripper open/check failed for the {_arm} arm: {_e}")
-                elif dual_handover:
+                elif dual_arm:
                     # Both arms move together for a dual session -- there is no "other arm locked as
                     # an obstacle" step to protect (see _run_yam_dual_rollout's docstring).
                     go_to_dual_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
@@ -1947,7 +1969,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         _spawn_postprocess(final_dir)
                     continue
 
-                if dual_handover:
+                if dual_arm:
                     # Simultaneous dual-arm/handover rollout: one perceive-plan-execute cycle
                     # against the 12-DOF chain, not a per-arm loop. Owns the whole recorded window
                     # the same way the sequential-bimanual branch above does.
@@ -2028,10 +2050,12 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         if cutamp_plan is not None:
                             plan_path = save_dir / "tiptop_plan.json"
                             trace_cfg = resolve_trace_cfg(container.cost_overrides)
-                            save_tiptop_plan(
-                                serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg), plan_path
-                            )
+                            serialized_plan = serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg)
+                            save_tiptop_plan(serialized_plan, plan_path)
                             _log.info(f"Saved TiPToP plan to {plan_path}")
+                            save_chosen_grasps(
+                                save_dir, serialized_plan, env, processed_scene.grasps, tiptop_cfg().robot.type
+                            )
 
                         if cutamp_plan is not None and execute_plan:
                             _log.info("Executing plan...")

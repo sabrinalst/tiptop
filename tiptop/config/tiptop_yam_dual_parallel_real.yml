@@ -1,0 +1,133 @@
+# TiPToP configuration for the REAL bimanual YAM -- SIMULTANEOUS dual-arm PARALLEL pick-and-place.
+#
+# Select it with TIPTOP_CONFIG (see config/__init__.py::_resolve_config_path):
+#
+#   TIPTOP_CONFIG=tiptop_yam_dual_parallel_real.yml pixi run tiptop-run --output-dir ... --enable-recording
+#
+# data-collection sets that variable for you from the `embodiment:` key of cfg/tamp/*.yml
+# (see collect/config.py and server/lib/sessions.js).
+#
+# Sibling of tiptop_yam_dual_real.yml: same 12-DOF embodiment, same rig, same execution path -- the
+# ONE difference is `dual_task`, which selects cuTAMP's operator list. `parallel` is
+# `dual_tamp_operators` = [MoveFree, PickBoth, MoveHoldingBoth, PlaceBoth]: both hands grasp at one
+# shared configuration and both release at one shared configuration (lockstep), so an episode does
+# exactly TWO on(movable, surface) goals at once, one per hand. There is no single-arm Pick/Place in
+# that list, which is why tiptop.yam.task_split.parallel_goal_builder keeps exactly one goal atom per
+# side of the midline and drops the rest with a logged reason -- a scene needs a movable AND its
+# target on each side of base_y, or the episode has nothing it can plan.
+#
+# vs the alternatives on the same hardware:
+#   * tiptop_yam_real.yml        -- sequential per-arm plans, one arm at a time (the safe default).
+#   * tiptop_yam_dual_real.yml   -- simultaneous, but `handover`: ONE object crossing the midline.
+#
+# DO NOT use this config until the sim-validation gate has passed for the PARALLEL task specifically
+# (the handover gate does not transfer -- different operator list, different plan shape: two objects
+# held at once, two grasps constrained at one configuration). Validate as the handover path was:
+# cuTAMP/cutamp/scripts/dual_arm_demo.py --task parallel for the planner, then consecutive clean sim
+# episodes replayed through tools/replay_tiptop_dual_plan.py with a human review of the videos, and
+# only then the staged physical rollout -- starting at this file's conservative time_dilation_factor,
+# with a human spotter at e-stop reach. This is real hardware: two arms carrying two objects through
+# one shared workspace, with no live inter-arm collision avoidance at execution time -- only the
+# pre-planned, pre-verified-safe joint path.
+#
+# PREREQUISITE -- the arm server must be running, in an environment that has i2rt:
+#
+#   sudo ip link set can_left  up type can bitrate 1000000
+#   sudo ip link set can_right up type can bitrate 1000000
+#   /home/prism-yam/openpi/examples/yam/.venv/bin/python tiptop/yam_arm_server.py
+#
+# tiptop talks to it over ZMQ; i2rt is never imported into this environment (it pins numpy 2.2.6 /
+# rerun >= 0.32, which cuRobo's pins here do not admit).
+
+robot:
+  # cuTAMP plans both arms as ONE 12-DOF chain for this embodiment -- see
+  # cutamp/robots/assets/bimanual_yam_dual.yml and cutamp/robots/bimanual_yam.py's DUAL constant.
+  # Unlike tiptop_yam_real.yml's `type: bimanual_yam_left` + `arms: [left, right]` (sequential, one
+  # plan per arm), there is no per-arm split here: one perceive-plan-execute cycle covers the whole
+  # episode (see tiptop_run.py's _run_yam_dual_rollout).
+  type: bimanual_yam_dual
+  dof: 12
+  arm_mode: dual
+  dual_task: parallel
+
+  # Midline the goal split uses, in the URDF `world` frame. Matches tiptop_yam_real.yml's base_y --
+  # same physical rig. For this task it decides which hand owns which goal atom: the movable at
+  # y >= base_y is the left arm's, and its target must be within REACH_MARGIN on that same side
+  # (tiptop.yam.task_split -- an atom crossing the midline needs a handover, which this operator
+  # list cannot express, so it is dropped).
+  base_y: 0.0
+
+  # yam_arm_server.py. Same port layout as tiptop_yam_real.yml -- identical physical rig, only the
+  # planning/execution SHAPE differs.
+  host: "127.0.0.1"
+  port: 5555
+  gripper_port: 5559
+  state_port: 5557
+
+  # As conservative as the handover config's, and for the same reason: two arms moving at once, no
+  # live inter-arm collision avoidance at execution. Raise toward tiptop_yam_real.yml's single-arm
+  # 0.3 only after repeated clean attempts, per the staged rollout -- here, not per-config in
+  # data-collection.
+  time_dilation_factor: 0.1
+
+  # Both arms' elbow-up rest posture, back to back -- matches
+  # cutamp.robots.bimanual_yam.bimanual_yam_neutral_joint_positions repeated twice (the dual chain's
+  # q_init/retract_config) and yam_arm_server.NEUTRAL_Q for each arm. Both arms are always live in a
+  # dual plan, collision-checked against each other's real geometry rather than against a locked
+  # obstacle -- see bimanual_yam_dual.yml's self-collision spheres.
+  q_home: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0,
+           0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+  q_capture: [0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0,
+              0.0, 0.7853981633974483, 1.5707963267948966, 0.0, 0.0, 0.0]
+
+cameras:
+  # Identical physical rig to tiptop_yam_real.yml -- same fixed third-person D435 the dual chain
+  # perceives through, same two wrist cameras recorded but not perceived from.
+  hand:
+    serial: "${oc.env:TIPTOP_TOP_CAMERA_ID,254622075770}"
+    type: realsense
+    width: 1280
+    height: 720
+    fps: 30
+    mount: world
+
+  external:
+    serial: "${oc.env:TIPTOP_LEFT_WRIST_CAMERA_ID,218622279640}"
+    type: realsense
+    width: 640
+    height: 360
+    fps: 30
+    record_only: true
+
+  external_2:
+    serial: "${oc.env:TIPTOP_RIGHT_WRIST_CAMERA_ID,353322271825}"
+    type: realsense
+    width: 640
+    height: 360
+    fps: 30
+    record_only: true
+
+perception:
+  foundation_stereo:
+    url: "http://localhost:${oc.env:TIPTOP_FS_PORT,1234}"
+
+  m2t2:
+    url: "http://localhost:${oc.env:TIPTOP_M2T2_PORT,8123}"
+    apply_bounds: true
+
+  # Same reasoning as tiptop_yam_real.yml: the YAM is 6-DOF per arm with no wrist null space, so
+  # half the valid grasps are otherwise unreachable. It matters more here than on either other
+  # config -- PickBoth has to satisfy BOTH hands at one configuration, so the more grasp candidates
+  # each object has, the more likely a jointly-feasible pair exists at all.
+  augment_flipped_grasps: true
+
+  sam:
+    mode: "local"
+
+  depth_trunc_m: 2.5
+  voxel_downsample_size: 0.0075
+  contact_threshold_m: 0.01
+  mask_erosion_pixels: 3
+
+  depth_smoothing:
+    num_frames: 5

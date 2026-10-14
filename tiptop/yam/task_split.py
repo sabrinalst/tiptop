@@ -232,3 +232,102 @@ def handover_goal_builder(base_y: float = 0.0):
         return handover, surfaces
 
     return build
+
+
+def parallel_goal_builder(base_y: float = 0.0):
+    """A ``goal_builder`` for a LOCKSTEP dual-arm episode (``bimanual_yam_dual``, ``dual_task:
+    parallel``): both hands pick at one configuration and place at one configuration.
+
+    The domain constraint here is the mirror image of :func:`handover_goal_builder`'s.
+    ``dual_tamp_operators`` = ``[MoveFree, PickBoth, MoveHoldingBoth, PlaceBoth]`` has no single-arm
+    Pick/Place either, and every one of its operators names TWO distinct objects — so a parallel
+    episode pursues EXACTLY two ``on(movable, surface)`` goals, one per hand, never one and never
+    three. This builder therefore keeps one atom per side of the midline and drops the rest with a
+    reason, the same "log and drop" philosophy the other two builders use.
+
+    Each kept atom must be doable by the single arm that owns its movable — an atom whose surface is
+    on the far side (:func:`atom_crosses_midline`) needs a handover, which this operator list cannot
+    express, so it is dropped rather than handed to an arm that can never satisfy it. Which kept atom
+    ends up on which hand is left to cuTAMP: the symbolic search grounds ``(obj_a, obj_b)`` both ways
+    round (``obj_a`` is the first arm in ``cutamp.rollout``'s ``self.arms``, ``obj_b`` the second) and
+    the kinematically impossible assignment simply has no satisfying particle.
+    """
+
+    def build(processed_scene, detected_atoms):
+        meshes = processed_scene.object_meshes
+        supported_by = supporting_surfaces(meshes)
+        known = set(meshes) | {processed_scene.table_cuboid.name}
+
+        per_side: dict[str, list[dict]] = {arm: [] for arm in ARMS}
+        satisfied, crossing, unknown = [], [], []
+        for atom in detected_atoms or []:
+            args = atom.get("args", [])
+            missing = [a for a in args if a not in known]
+            if missing:
+                unknown.append((atom, missing))
+                continue
+            if already_satisfied(atom, supported_by):
+                satisfied.append(atom)
+                continue
+            if atom_crosses_midline(atom, meshes, base_y):
+                crossing.append(atom)
+                continue
+            if atom.get("predicate") != "on" or len(args) != 2 or args[0] not in meshes:
+                continue  # not an on(movable, surface) this domain can plan
+            movable_y = float(np.asarray(meshes[args[0]].pose, dtype=float)[1])
+            per_side[object_side(movable_y, base_y)].append(atom)
+
+        # One atom per hand. Extras are not a failure -- they are simply the next episode's work.
+        kept = [atoms[0] for atoms in (per_side["left"], per_side["right"]) if atoms]
+        extra = [a for atoms in per_side.values() for a in atoms[1:]]
+
+        surfaces = {
+            a["args"][1]
+            for a in (detected_atoms or [])
+            if a.get("predicate") == "on" and len(a.get("args", [])) == 2 and a["args"][1] in meshes
+        }
+
+        if len(kept) < 2:
+            # PickBoth/PlaceBoth need two distinct objects, so one atom is as unplannable as none.
+            # Returning [] makes the rollout skip the episode with a clear log instead of handing
+            # cuTAMP a goal no skeleton in this operator list can reach.
+            side = "left" if per_side["left"] else "right"
+            _log.warning(
+                "parallel: need one goal per arm, but "
+                + (
+                    f"only the {side} arm has one ({kept[0]['args']})"
+                    if kept
+                    else "neither arm has one"
+                )
+                + f" (midline base_y={base_y}). Nothing to plan this episode -- place one movable and "
+                "its target on each side of the midline."
+            )
+            kept = []
+
+        _log.info(
+            f"parallel goal: {[a['args'] for a in kept] or '(nothing to do)'}"
+            + (
+                f"; {[a['args'] for a in extra]} are a second pick for the same arm (dropped this episode)"
+                if extra
+                else ""
+            )
+            + (f"; {[a['args'] for a in satisfied]} already satisfied" if satisfied else "")
+            + (f"; {[a['args'] for a in crossing]} need a handover" if crossing else "")
+            + (f"; protected surfaces {sorted(surfaces)}" if surfaces else "")
+        )
+        for atom, missing in unknown:
+            _log.warning(
+                f"parallel: dropping goal {atom.get('predicate')}({', '.join(atom.get('args', []))}) — "
+                f"perception did not reconstruct {missing}. Move it by hand if it should have been placed."
+            )
+        for atom in crossing:
+            movable, surface = atom["args"]
+            _log.error(
+                f"parallel: dropping goal on({movable}, {surface}) — '{movable}' and '{surface}' are on "
+                f"opposite sides of the midline (base_y={base_y}), so the arm that can pick it cannot "
+                "place it. Lockstep dual (dual_task: parallel) has no handover operator -- use a "
+                "dual_task: handover config for this scene, or move the target to the movable's side."
+            )
+        return kept, surfaces
+
+    return build

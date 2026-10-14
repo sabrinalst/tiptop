@@ -15,6 +15,7 @@ from tiptop.yam.task_split import (
     atom_crosses_midline,
     handover_goal_builder,
     object_side,
+    parallel_goal_builder,
     split_by_arm,
 )
 
@@ -230,3 +231,90 @@ def test_handover_goal_builder_drops_already_satisfied_atoms():
     atoms, _ = handover_goal_builder()(scene, goal)
 
     assert atoms == []
+
+
+# -- parallel_goal_builder ------------------------------------------------------------------------
+# The lockstep domain (dual_tamp_operators) acts on two objects at once and has no single-arm
+# Pick/Place, so its goal is exactly two atoms -- one per hand -- or nothing at all.
+
+LEFT_BOWL = _box("left_bowl", center=(0.5, 0.28, 0.01), size=(0.16, 0.16, 0.02))
+RIGHT_BOWL = _box("right_bowl", center=(0.5, -0.28, 0.01), size=(0.16, 0.16, 0.02))
+LEFT_CAN = _box("left_can", center=(0.25, 0.22, 0.05), size=(0.06, 0.06, 0.10))
+RIGHT_CAN = _box("right_can", center=(0.25, -0.22, 0.05), size=(0.06, 0.06, 0.10))
+
+PARALLEL_SCENE = _Scene({m.name: m for m in (LEFT_BOWL, RIGHT_BOWL, LEFT_CAN, RIGHT_CAN)})
+PARALLEL_GOAL = [
+    {"predicate": "on", "args": ["left_can", "left_bowl"]},
+    {"predicate": "on", "args": ["right_can", "right_bowl"]},
+]
+
+
+def test_parallel_goal_builder_keeps_one_atom_per_arm():
+    atoms, surfaces = parallel_goal_builder()(PARALLEL_SCENE, PARALLEL_GOAL)
+
+    assert [a["args"] for a in atoms] == [["left_can", "left_bowl"], ["right_can", "right_bowl"]]
+    assert surfaces == {"left_bowl", "right_bowl"}
+
+
+def test_parallel_goal_builder_drops_a_second_pick_for_the_same_arm():
+    """PickBoth grasps one object per hand, so a third atom has no hand to be planned on."""
+    second_left_can = _box("other_can", center=(0.25, 0.30, 0.05), size=(0.06, 0.06, 0.10))
+    scene = _Scene({**PARALLEL_SCENE.object_meshes, "other_can": second_left_can})
+    goal = PARALLEL_GOAL + [{"predicate": "on", "args": ["other_can", "left_bowl"]}]
+
+    atoms, _ = parallel_goal_builder()(scene, goal)
+
+    assert [a["args"] for a in atoms] == [["left_can", "left_bowl"], ["right_can", "right_bowl"]]
+
+
+def test_parallel_goal_builder_needs_work_on_both_sides(caplog):
+    """One atom is as unplannable as none here: every operator in the list names two objects."""
+    scene = _Scene({m.name: m for m in (LEFT_BOWL, LEFT_CAN)})
+    goal = [{"predicate": "on", "args": ["left_can", "left_bowl"]}]
+
+    with caplog.at_level("WARNING"):
+        atoms, _ = parallel_goal_builder()(scene, goal)
+
+    assert atoms == []
+    assert "one goal per arm" in caplog.text
+
+
+def test_parallel_goal_builder_drops_a_crossing_atom():
+    """A can whose bowl is on the other side needs a handover, which this operator list lacks."""
+    scene = _Scene({m.name: m for m in (LEFT_CAN, FAR_PLATE, RIGHT_CAN, RIGHT_BOWL)})
+    goal = [
+        {"predicate": "on", "args": ["left_can", "far_plate"]},  # crosses the midline
+        {"predicate": "on", "args": ["right_can", "right_bowl"]},
+    ]
+
+    atoms, _ = parallel_goal_builder()(scene, goal)
+
+    assert atoms == []  # only the right arm is left with work, and one atom cannot be planned
+
+
+def test_parallel_goal_builder_drops_already_satisfied_atoms():
+    # left_bowl's top sits at z=0.02 (center 0.01, half-height 0.01); rest this can's bottom there.
+    placed = _box("left_can", center=(0.5, 0.28, 0.07), size=(0.06, 0.06, 0.10))
+    scene = _Scene({m.name: m for m in (LEFT_BOWL, RIGHT_BOWL, placed, RIGHT_CAN)})
+
+    atoms, _ = parallel_goal_builder()(scene, PARALLEL_GOAL)
+
+    assert atoms == []  # the left arm's goal is done; the right arm alone cannot be planned
+
+
+def test_parallel_goal_builder_honours_a_shifted_midline():
+    """Which hand owns which goal is read off base_y, not off the sign of y."""
+    # base_y = -0.25 puts BOTH cans on the left arm's side, leaving the right arm nothing to do.
+    atoms, _ = parallel_goal_builder(base_y=-0.25)(PARALLEL_SCENE, PARALLEL_GOAL)
+    assert atoms == []
+
+    # base_y = 0.25 splits the same pair the other way: left_can (y=0.22) is now the RIGHT arm's,
+    # and only a can further out than the midline is the left arm's.
+    far_can = _box("far_can", center=(0.25, 0.42, 0.05), size=(0.06, 0.06, 0.10))
+    far_bowl = _box("far_bowl", center=(0.5, 0.50, 0.01), size=(0.16, 0.16, 0.02))
+    scene = _Scene({**PARALLEL_SCENE.object_meshes, "far_can": far_can, "far_bowl": far_bowl})
+    goal = PARALLEL_GOAL + [{"predicate": "on", "args": ["far_can", "far_bowl"]}]
+
+    atoms, _ = parallel_goal_builder(base_y=0.25)(scene, goal)
+
+    assert [a["args"] for a in atoms] == [["far_can", "far_bowl"], ["left_can", "left_bowl"]]
