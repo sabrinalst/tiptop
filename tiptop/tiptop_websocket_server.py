@@ -29,6 +29,7 @@ from curobo.geom.types import WorldConfig
 from curobo.wrap.reacher.ik_solver import IKSolver
 from curobo.wrap.reacher.motion_gen import MotionGen
 
+from tiptop.chosen_grasp import save_chosen_grasps
 from tiptop.config import tiptop_cfg
 from tiptop.motion_planning import (
     build_curobo_solvers,
@@ -359,6 +360,7 @@ class TiptopPlanningServer:
             serialized_plan = serialize_plan(cutamp_plan, q_init, trace_cfg=resolve_trace_cfg(self._curobo_overrides))
             plan_path = save_dir / "tiptop_plan.json"
             save_tiptop_plan(serialized_plan, plan_path)
+            save_chosen_grasps(save_dir, serialized_plan, env, processed_scene.grasps, tiptop_cfg().robot.type)
             _log.info(f"Saved outputs to {save_dir}")
 
             return {

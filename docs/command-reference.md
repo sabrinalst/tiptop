@@ -434,6 +434,39 @@ Plan visualization is skipped if `tiptop_plan.json` is not found in the run dire
 
 ---
 
+### viz-chosen-grasp
+
+Shows which M2T2 grasp cuTAMP actually chose, drawn on the point cloud it was chosen from. The chosen grasp is green; the candidates it was picked out of are colored by M2T2 confidence.
+
+The saved plan only names its grasp symbolically (`Pick(block, grasp1, q1)`), so the pose is read from `perception/chosen_grasps.json`, which every run now writes alongside `grasps.pt`. Runs recorded before that file existed are handled too — the grasp is recovered from the plan on the fly.
+
+**Prerequisites:**
+
+- A saved run directory containing `perception/` (`pointcloud.ply`, `grasps.pt`, `cutamp_env.pkl`) and the run's plan
+
+**Available flags:**
+
+- `PATH` - A run directory, one of its arm directories, or any file inside either (required)
+- `--show-candidates / --no-show-candidates` - Also draw the candidates that were not chosen (default: True)
+- `--num-candidates INT` - Maximum candidates to draw per object (default: 30)
+
+**Example usage:**
+
+```bash
+# A whole bimanual run — both arms, each under its own entity prefix
+viz-chosen-grasp runs/prism/tamp/yam_toys/success/2026-01-24_15-30-00/
+
+# Just the point cloud you were looking at
+viz-chosen-grasp runs/.../2026-01-24_15-30-00/right/perception/pointcloud.ply
+
+# Chosen grasp only, no candidate cloud around it
+viz-chosen-grasp runs/.../2026-01-24_15-30-00/ --no-show-candidates
+```
+
+The console prints which candidate index was matched, its M2T2 confidence, and how far the recovered pose landed from it. Because cuTAMP does not optimize grasp parameters, that distance is the IK residual (microns) — anything larger means the match should not be trusted, and is warned about.
+
+---
+
 ## Setup and Calibration
 
 ### tiptop-config

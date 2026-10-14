@@ -18,6 +18,7 @@ import rerun as rr
 import tyro
 from scipy.spatial.transform import Rotation
 
+from tiptop.chosen_grasp import save_chosen_grasps
 from tiptop.config import tiptop_cfg
 from tiptop.motion_planning import build_curobo_solvers
 from tiptop.perception.cameras import Frame
@@ -198,8 +199,10 @@ def run_tiptop_h5(
 
         if cutamp_plan is not None:
             plan_path = save_dir / "tiptop_plan.json"
-            save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init), plan_path)
+            serialized_plan = serialize_plan(cutamp_plan, observation.q_init)
+            save_tiptop_plan(serialized_plan, plan_path)
             _log.info(f"Saved TiPToP plan to {plan_path}")
+            save_chosen_grasps(save_dir, serialized_plan, env, processed_scene.grasps, tiptop_cfg().robot.type)
         else:
             _log.warning(f"No plan found: {failure_reason}")
 
