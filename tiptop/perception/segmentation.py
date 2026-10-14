@@ -81,12 +81,19 @@ def segment_table_with_ransac(
     valid_mask: np.ndarray = None,
     max_planes: int = 5,
     contact_threshold: float = 0.03,
+    max_tilt_deg: float = 20.0,
 ) -> trimesh.primitives.Box:
     """Segment the table by finding the plane that the most detected objects rest on.
 
-    Runs iterative RANSAC to find candidate planes, then scores each by how many object
-    contact points (bottom of each object's point cloud) lie within `contact_threshold`
-    of the plane. The winning plane is the table surface.
+    Runs iterative RANSAC to find candidate planes, discards any whose normal is more than
+    `max_tilt_deg` from world z, then scores the rest by how many object contact points (bottom of
+    each object's point cloud) lie within `contact_threshold` of the plane. The winning plane is the
+    table surface.
+
+    The tilt gate matters: contact-point score alone lets a near-vertical plane through the
+    workspace (a wall, an arm, a rig upright) beat the real table, since such a plane passes close
+    to every object. That puts the "table top" metres above the real one and the z-filter in
+    segment_pointcloud_by_masks then strips objects down to slivers.
 
     Args:
         xyz_world: (H, W, 3) structured point cloud in world frame.
@@ -96,6 +103,8 @@ def segment_table_with_ransac(
         max_planes: Maximum number of RANSAC iterations to run.
         contact_threshold: Distance (metres) within which an object contact point
                            is considered to lie on a candidate plane.
+        max_tilt_deg: Maximum angle (degrees) between a candidate plane's normal and world z for
+                      that plane to be considered a table.
 
     Returns:
         table_box: trimesh.primitives.Box representing the table.
@@ -124,7 +133,9 @@ def segment_table_with_ransac(
     # Iterative RANSAC: score each candidate plane by number of objects resting on it
     remaining_pcd = pcd
     best_score = -1
+    best_num_inliers = -1
     best_pcd = None
+    min_cos_tilt = np.cos(np.deg2rad(max_tilt_deg))
 
     for i in range(max_planes):
         if len(remaining_pcd.points) < 50:
@@ -139,18 +150,29 @@ def segment_table_with_ransac(
         score = int((dists < contact_threshold).sum())
 
         inlier_pcd = remaining_pcd.select_by_index(inlier_idxs)
-        _log.debug(f"Plane {i}: model={plane_model}, objects_on_plane={score}/{len(contact_pts)}")
-
-        if score > best_score:
-            best_score = score
-            best_pcd = inlier_pcd
-
+        tilt_deg = float(np.rad2deg(np.arccos(min(abs(c) / norm, 1.0))))
+        _log.debug(
+            f"Plane {i}: model={plane_model}, objects_on_plane={score}/{len(contact_pts)}, "
+            f"tilt={tilt_deg:.1f}deg, inliers={len(inlier_idxs)}"
+        )
         remaining_pcd = remaining_pcd.select_by_index(inlier_idxs, invert=True)
+
+        if abs(c) / norm < min_cos_tilt:
+            _log.debug(f"Plane {i}: rejected, tilt {tilt_deg:.1f}deg exceeds max_tilt_deg={max_tilt_deg}")
+            continue
+
+        # Break ties on inlier count: among equally-supported horizontal planes the table is the
+        # largest one, not whichever RANSAC happened to peel off first.
+        if score > best_score or (score == best_score and len(inlier_idxs) > best_num_inliers):
+            best_score = score
+            best_num_inliers = len(inlier_idxs)
+            best_pcd = inlier_pcd
 
     if best_pcd is None or best_score == 0:
         raise RuntimeError(
-            f"No plane found with objects resting on it (tried {max_planes} planes, "
-            f"{len(contact_pts)} contact points, threshold={contact_threshold}m)."
+            f"No horizontal plane found with objects resting on it (tried {max_planes} planes, "
+            f"{len(contact_pts)} contact points, threshold={contact_threshold}m, "
+            f"max_tilt_deg={max_tilt_deg})."
         )
 
     _log.info(f"Selected table plane with {best_score}/{len(contact_pts)} objects")
