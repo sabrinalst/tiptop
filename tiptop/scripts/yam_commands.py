@@ -72,22 +72,64 @@ def _warn_if_other_arm_displaced(arm: str) -> None:
         )
 
 
-def go_home_yam(arm: ArmChoice = "both", time_dilation_factor: float | None = None):
-    """Return the YAM arm(s) to the neutral posture, through cuRobo, one at a time."""
+# The zero posture has joints 2 and 3 exactly on their lower limits (0), and cuRobo rejects a start or goal
+# state on a joint limit. Moves to or from it therefore go straight through the arm server's ``move_to``,
+# which interpolates in joint space with no planning and no collision checking.
+ZERO_Q = (0.0,) * 6
+
+
+def _move_directly(arms: list[str], q_target, time_dilation_factor: float) -> None:
+    """Move each arm to ``q_target`` through the arm server, one at a time. Keep the workspace clear."""
+    from tiptop.utils import get_robot_client
+
+    client = get_robot_client()
+    duration = 2.0 / time_dilation_factor
+    for a in arms:
+        _log.info(f"Moving the {a} arm directly (no collision checking) over {duration:.1f}s")
+        res = client.move_to(q_target, duration=duration, arm=a)
+        if not res.get("success"):
+            raise RuntimeError(f"moving the {a} arm failed: {res.get('error')}")
+
+
+def go_home_yam(
+    arm: ArmChoice = "both",
+    neutral: bool = False,
+    zero: bool = False,
+    time_dilation_factor: float | None = None,
+):
+    """Return the YAM arm(s) to the neutral posture (default, ``--neutral``) or the zero posture (``--zero``).
+
+    Neutral is planned through cuRobo, one arm at a time. If cuRobo rejects the arm's current state because
+    it rests on a joint limit (the zero posture does), the move is made directly instead.
+    """
+    from cutamp.motion_solver import MotionPlanningError
+
     from tiptop.config import tiptop_cfg
     from tiptop.motion_planning import go_to_home
-    from tiptop.yam import active_arm
+    from tiptop.yam import NEUTRAL_Q, active_arm
 
+    if neutral and zero:
+        raise ValueError("--neutral and --zero are mutually exclusive")
     arms = _arms_to_drive(arm)
     if time_dilation_factor is None:
         time_dilation_factor = tiptop_cfg().robot.time_dilation_factor
+
+    if zero:
+        _move_directly(arms, ZERO_Q, time_dilation_factor)
+        return
 
     for a in arms:
         with active_arm(a):
             _warn_if_other_arm_displaced(a)
             _log.info(f"Homing the {a} arm")
             # No motion_gen to share: each arm is its own embodiment, so each needs its own solver.
-            go_to_home(time_dilation_factor=time_dilation_factor)
+            try:
+                go_to_home(time_dilation_factor=time_dilation_factor)
+            except MotionPlanningError as e:
+                if "JOINT_LIMITS" not in str(e):
+                    raise
+                _log.warning(f"cuRobo rejected the {a} arm's state on a joint limit ({e}); moving directly instead")
+                _move_directly([a], NEUTRAL_Q, time_dilation_factor)
 
 
 def gripper_open_yam(arm: ArmChoice = "both", speed: float = 1.0, force: float = 0.1):

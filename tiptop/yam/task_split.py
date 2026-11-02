@@ -5,11 +5,12 @@ operator for choosing an arm, so something outside it has to decide who picks wh
 position taken by ``droid-sim-evals/eval/yam_tiptop_eval.py::_split_by_arm``, which this mirrors on
 real hardware.
 
-**The rule is the geometry the reachability sweep measured.** With the base column at
-``(0.24, 0, 0.0551)`` the left arm is mounted at ``y = +0.24`` and the right at ``y = -0.24``
-(``cutamp/robots/assets/yam_description/bimanual_yam.urdf``); the left reaches ``y >= -0.17`` and the
-right ``y <= +0.17``, so splitting at the midline gives each arm objects it can definitely reach and
-puts the ambiguous middle ones on whichever side they lean.
+**The rule is the geometry the reachability sweep measured.** The world origin is midway between the arm
+bases, with the left arm at ``y = +0.263`` and the right at ``y = -0.263``
+(``cutamp/robots/assets/yam_description/rig.json``, from raiden's calibration); the sweep that chose this
+rule used the earlier ``y = +/-0.24`` placement, where the left reached ``y >= -0.17`` and the right
+``y <= +0.17``. Splitting at the midline gives each arm objects it can definitely reach and puts the
+ambiguous middle ones on whichever side they lean.
 
 **One difference from the sim, and it matters.** The sim harness reads object poses from the
 simulator; here they come from perception, and perception runs again before the second arm plans —

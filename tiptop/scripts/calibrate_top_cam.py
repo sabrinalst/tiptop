@@ -19,7 +19,7 @@ pose. It also has to face the CAMERA — a board turned edge-on projects to a sl
 to a fraction of a pixel with the pose metres out of place, which is why the presentation gates
 exist and why ``--mode aim`` is there to set it up.
 
-Five modes:
+Six modes:
 
 ``handeye`` (default, recommended)
     Board clamped to one gripper. The arm visits N poses, the camera sees the board at each, and
@@ -28,12 +28,18 @@ Five modes:
     to be measured by hand.
 
 ``manual``
-    The same calibration with the poses chosen by hand. The arm's six joints go limp — gravity
-    compensated, gripper still clamped — and you push the board around yourself; each time you hold
-    still somewhere new, that pose is captured. The board still has to be **in the gripper**, and
+    The same calibration with poses chosen by hand and a live camera view. M + Enter releases the
+    arm for hand-guiding; R + Enter locks the joints, waits for settling and records a pose.
+    The arm stays locked until M; D deletes, L lists, Q finishes. The board must be **in the gripper**, and
     for the same reason as ever: FK of the measured joints is the only thing that ties a board
     observation to the world frame. A board carried in your hand, off the robot, constrains nothing
     at all, however many views of it the camera gets. See :func:`_capture_manual`.
+
+``playback``
+    Teach-and-repeat. Every pose ``manual`` accepts is recorded as joint angles in the run's
+    ``manual_poses.json``; ``--mode playback --poses <that run>`` makes the arm move itself back
+    through them — collision-checked joint-space moves to the exact taught configuration — and
+    capture at each with nobody touching the arm or the board. See :func:`_capture_playback`.
 
 ``aim``
     Turns the wrist until the board faces the camera, then stops without calibrating. The same
@@ -52,10 +58,8 @@ Five modes:
     arm. From there the arm drives the board through one smooth loop around the anchor — a Lissajous
     pattern in position and orientation, the same shape DROID's ``calibration_traj`` traces — and
     takes a sample at each point along it, rather than the independently-perturbed poses ``handeye``
-    visits. It solves with the DANIILIDIS method by default (DROID's fixed choice, rather than
-    ``handeye``'s run-all-five-and-keep-the-best) and, before trusting the result, checks it against
-    a held-out split of the samples the way DROID's ``is_calibration_accurate`` does — a solve that
-    only fits the data it came from is not caught by in-sample residuals alone. See
+    visits. All moving-board modes compare hand-eye initializers, jointly refine camera and board
+    mount against image corners, and validate on random and spatial held-out splits. See
     :func:`_capture_sweep` and :func:`_holdout_check`.
 
 Eye-to-hand, concretely: OpenCV's ``calibrateHandEye`` solves ``A·X·B = C`` for ``X`` given
@@ -72,6 +76,12 @@ which is the same ``A·X·B = C`` with ``A = ee_from_world`` (the INVERTED gripp
 is clamped to. Perturbations are small and centred on a pose you choose, but keep the workspace
 clear and watch the arm.
 
+**Live view.** Every mode except ``--replay`` streams the top camera to a Rerun web viewer, with the
+detected corners, the board axes and the capture gates' verdict drawn on, so you can see what to
+adjust. It reuses the Rerun server on 127.0.0.1:9876 if one is up (YAM.md starts one for tiptop-run)
+and otherwise starts its own on the same ports, so one SSH tunnel serves both; the URL and tunnel
+command are logged at the start. ``--no-live-view`` turns it off.
+
 Usage::
 
     # 1. clamp the board in the gripper, then let the arm turn it to face the camera
@@ -80,8 +90,12 @@ Usage::
     # 2. left arm holds the board; it aims itself first, and the right arm is parked for you
     DC_WORKSPACE=prism pixi run calibrate-top-cam --arm left
 
-    # ... or move the board yourself: the arm goes limp and each steady new pose is captured
+    # ... or hand-pose with live view: M releases, R locks and records (then Enter)
     DC_WORKSPACE=prism pixi run calibrate-top-cam --mode manual --arm left --close-gripper
+
+    # ... then have the arm repeat those taught poses on its own and calibrate from them
+    DC_WORKSPACE=prism pixi run calibrate-top-cam --mode playback --arm left --close-gripper \
+        --poses tiptop/.cache/top_cam_calib/<manual run>
 
     # a plain 9x6-inner-corner chessboard instead of the Charuco default
     DC_WORKSPACE=prism pixi run calibrate-top-cam --board-kind chessboard --cols 9 --rows 6 \
@@ -94,19 +108,29 @@ Usage::
     pixi run calibrate-top-cam --replay tiptop/.cache/top_cam_calib/20260802-141530
 """
 
+import getpass
 import json
 import logging
 import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
+from urllib.parse import quote, urlparse
 
 import cv2
 import numpy as np
+import rerun as rr
+import rerun.blueprint as rrb
 import tyro
 from cv2 import aruco
 from scipy.spatial.transform import Rotation as Rot
+from scipy.optimize import least_squares
 
 _log = logging.getLogger(__name__)
 
@@ -124,6 +148,9 @@ HAND_EYE_METHODS = {
     "andreff": cv2.CALIB_HAND_EYE_ANDREFF,
     "daniilidis": cv2.CALIB_HAND_EYE_DANIILIDIS,
 }
+
+# How long playback waits for the arm to come to rest after a move before giving up on that pose.
+SETTLE_TIMEOUT_S = 5.0
 
 # The sim design pose this calibration is meant to replace, for the before/after report.
 SIM_DESIGN_POSE = np.array([0.39, 0.0, 0.8551, -2.9670597283903604, 0.0, -1.5707963267948966])
@@ -370,6 +397,7 @@ class Metrics:
     offset_trans_rms_mm: float  # spread of ee_from_board across samples
     offset_rot_rms_deg: float
     per_sample_reproj_px: np.ndarray
+    ee_from_board: np.ndarray
 
 
 def _reproject_errors(
@@ -382,13 +410,19 @@ def _reproject_errors(
     per_sample = []
     for s in samples:
         predicted = cam_from_world @ s.world_from_ee @ mean_offset
+        if np.any((s.obj_pts @ predicted[:3, :3].T + predicted[:3, 3])[:, 2] <= 0):
+            per_sample.append(float("inf"))
+            continue
         rvec = cv2.Rodrigues(predicted[:3, :3])[0]
         projected, _ = cv2.projectPoints(s.obj_pts, rvec, predicted[:3, 3], K, dist)
         per_sample.append(float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2) - s.img_pts) ** 2, axis=1)))))
     return np.array(per_sample)
 
 
-def evaluate(samples: list[Sample], world_from_cam: np.ndarray, K: np.ndarray, dist: np.ndarray) -> Metrics:
+def evaluate(
+    samples: list[Sample], world_from_cam: np.ndarray, K: np.ndarray, dist: np.ndarray,
+    mean_offset: np.ndarray | None = None,
+) -> Metrics:
     """Score a candidate calibration end to end.
 
     ``pnp_error_px`` only says the board was detected cleanly; it is blind to the calibration. This
@@ -396,7 +430,8 @@ def evaluate(samples: list[Sample], world_from_cam: np.ndarray, K: np.ndarray, d
     shared ``ee_from_board``, and reprojects — so every term in the chain is on trial, in pixels.
     """
     offsets = _board_offsets(samples, world_from_cam)
-    mean_offset = _mean_offset(offsets)
+    if mean_offset is None:
+        mean_offset = _mean_offset(offsets)
 
     trans_rms_mm = float(np.sqrt(np.mean(np.sum((offsets[:, :3, 3] - mean_offset[:3, 3]) ** 2, axis=1))) * 1000.0)
     rel = np.einsum("ij,njk->nik", mean_offset[:3, :3].T, offsets[:, :3, :3])
@@ -410,6 +445,7 @@ def evaluate(samples: list[Sample], world_from_cam: np.ndarray, K: np.ndarray, d
         offset_trans_rms_mm=trans_rms_mm,
         offset_rot_rms_deg=rot_rms_deg,
         per_sample_reproj_px=per_sample,
+        ee_from_board=mean_offset,
     )
 
 
@@ -431,11 +467,64 @@ def _rotation_defect(mat: np.ndarray) -> str | None:
     return None
 
 
+def _refine_extrinsics(samples, world_from_cam, K, dist):
+    """Jointly fit camera and rigid board mount to pixels, with fixed intrinsics/FK.
+
+    Rotation vectors avoid Euler singularities. Soft-L1 limits individual bad corners'
+    influence; each pose has equal total weight regardless of visible corner count.
+    """
+    def pack(T):
+        return np.r_[Rot.from_matrix(T[:3, :3]).as_rotvec(), T[:3, 3]]
+
+    def unpack(x):
+        return _mat_from_rt(Rot.from_rotvec(x[:3]).as_matrix(), x[3:6])
+
+    offset = _mean_offset(_board_offsets(samples, world_from_cam))
+    typical_count = float(np.median([len(s.obj_pts) for s in samples]))
+
+    def residual(x):
+        cam_from_world, ee_from_board = np.linalg.inv(unpack(x[:6])), unpack(x[6:])
+        errors = []
+        for s in samples:
+            predicted = cam_from_world @ s.world_from_ee @ ee_from_board
+            points = s.obj_pts @ predicted[:3, :3].T + predicted[:3, 3]
+            if np.any(points[:, 2] <= 0):
+                raise ValueError("refinement placed board behind the camera")
+            projected, _ = cv2.projectPoints(
+                s.obj_pts, cv2.Rodrigues(predicted[:3, :3])[0], predicted[:3, 3], K, dist
+            )
+            errors.append((projected.reshape(-1, 2) - s.img_pts).ravel()
+                          * np.sqrt(typical_count / len(s.obj_pts)))
+        return np.concatenate(errors)
+
+    fit = least_squares(
+        residual, np.r_[pack(world_from_cam), pack(offset)], loss="soft_l1",
+        f_scale=1.0, x_scale="jac", max_nfev=300,
+    )
+    if not fit.success or not np.all(np.isfinite(fit.x)):
+        raise ValueError(f"extrinsic refinement failed: {fit.message}")
+    return unpack(fit.x[:6]), unpack(fit.x[6:])
+
+
+def _check_conditioning(samples: list[Sample]) -> None:
+    """Translation of the hand-eye transform needs rotations about distinct axes."""
+    blocks = []
+    for i, a in enumerate(samples):
+        for b in samples[i + 1:]:
+            blocks.append(a.world_from_ee[:3, :3].T @ b.world_from_ee[:3, :3] - np.eye(3))
+    if not blocks:
+        raise RuntimeError("Need multiple rotated poses")
+    singular = np.linalg.svd(np.concatenate(blocks), compute_uv=False)
+    if _rotation_diversity_deg(samples) < 20 or singular[-1] / max(singular[0], 1e-12) < 0.1:
+        raise RuntimeError("Poorly conditioned poses: rotate at least 20 degrees across multiple axes")
+
+
 def _solve(
     samples: list[Sample], K: np.ndarray, dist: np.ndarray, method: str
 ) -> tuple[np.ndarray, Metrics, str, dict[str, Metrics]]:
     """Run the requested solver, or every solver and keep the best-reprojecting one."""
     names = list(HAND_EYE_METHODS) if method == "auto" else [method]
+    _check_conditioning(samples)
     scored: dict[str, Metrics] = {}
     results: dict[str, np.ndarray] = {}
     for name in names:
@@ -448,8 +537,13 @@ def _solve(
         if defect is not None:
             _log.info(f"hand-eye method {name!r} returned {defect}; skipping it")
             continue
+        try:
+            candidate, offset = _refine_extrinsics(samples, candidate, K, dist)
+        except (ValueError, cv2.error) as e:
+            _log.warning(f"{name} refinement failed: {e}")
+            continue
         results[name] = candidate
-        scored[name] = evaluate(samples, candidate, K, dist)
+        scored[name] = evaluate(samples, candidate, K, dist, offset)
     if not scored:
         raise RuntimeError(
             f"every hand-eye solver failed on {len(samples)} samples. Usually too few poses or too "
@@ -508,6 +602,18 @@ def presentation(cam_from_board: np.ndarray, img_pts: np.ndarray, image_shape: t
     extent = img_pts.max(axis=0) - img_pts.min(axis=0)
     coverage = float(np.linalg.norm(extent) / np.linalg.norm(image_shape))
     return incidence, coverage
+
+
+def solve_observation(bgr: np.ndarray, spec: BoardSpec, board, K: np.ndarray, dist: np.ndarray) -> tuple | None:
+    """The board solved in one image: ``(obj_pts, img_pts, cam_from_board, err, incidence, coverage)``,
+    or None if it was not detected."""
+    detection = detect_board(bgr, spec, board)
+    if detection is None:
+        return None
+    obj_pts, img_pts = detection
+    cam_from_board, err = solve_pnp(obj_pts, img_pts, K, dist)
+    incidence, coverage = presentation(cam_from_board, img_pts, bgr.shape[:2][::-1])
+    return obj_pts, img_pts, cam_from_board, err, incidence, coverage
 
 
 def rigidity_violations(samples: list[Sample], rot_tol_deg: float = 2.0, trans_tol_mm: float = 10.0) -> tuple:
@@ -592,48 +698,29 @@ def _holdout_check(
     max_rms_px: float,
     seed: int,
 ) -> None:
-    """Solve on a random subset and check the rest still reprojects well, mirroring DROID's
-    ``is_calibration_accurate``.
+    """Check random and spatially grouped holdouts without fitting either test set.
 
-    In-sample residuals cannot catch a solve that only fits the data it was given — with enough
-    samples clustered the same way, an eye-to-hand solution can look good on its own set and still
-    be wrong. This is a genuine held-out check: ``world_from_cam`` and ``ee_from_board`` are both
-    fit from the train split alone, then scored against test samples the fit never saw. It gates
-    saving, the same way DROID's check refuses to write a calibration that fails it, but is not the
-    calibration that gets saved — the final solve still uses every sample (see the caller).
+    Run on the original observations, before final outlier removal. Grouped holdout
+    probes extrapolation across the captured workspace rather than only interpolation.
+    A failed/degenerate validation solve is a failed calibration, never a skipped gate.
     """
-    if len(samples) < 4:
-        _log.warning(f"Only {len(samples)} samples; skipping the train/test holdout check")
-        return
     rng = np.random.default_rng(seed)
-    order = rng.permutation(len(samples))
     n_test = max(1, round(len(samples) * test_fraction))
-    train = [samples[i] for i in sorted(order[n_test:].tolist())]
-    test = [samples[i] for i in sorted(order[:n_test].tolist())]
-    if len(train) < 3 or not test:
-        _log.warning("Too few samples for both a train and a test split; skipping the holdout check")
-        return
-
-    try:
-        candidate = solve_eye_to_hand(train, HAND_EYE_METHODS[method])
-    except cv2.error as e:
-        _log.warning(f"Holdout solve failed ({e}); skipping the check")
-        return
-    if _rotation_defect(candidate) is not None:
-        _log.warning("Holdout solve degenerated; skipping the check")
-        return
-
-    mean_offset = _mean_offset(_board_offsets(train, candidate))
-    per_sample = _reproject_errors(test, candidate, mean_offset, K, dist)
-    rms = float(np.sqrt(np.mean(per_sample**2)))
-    _log.info(f"Holdout check: {len(train)} train / {len(test)} test samples, {rms:.2f} px RMS on the held-out set")
-    if rms > max_rms_px:
-        raise RuntimeError(
-            f"held-out reprojection error {rms:.2f} px exceeds --outlier-px {max_rms_px:.2f}: a "
-            f"calibration solved from {len(train)} of the samples does not generalize to the "
-            f"{len(test)} it never saw. Samples are kept in the run directory for --replay; try "
-            "more poses, a larger --rot-scale-deg, or check --square-size against the printout."
-        )
+    if len(samples) - n_test < 4:
+        raise RuntimeError("Need at least four training poses plus held-out poses")
+    positions = np.array([s.world_from_ee[:3, 3] for s in samples])
+    axis = int(np.argmax(np.ptp(positions, axis=0)))
+    orders = {"random": rng.permutation(len(samples)), "spatial": np.argsort(positions[:, axis])}
+    for label, order in orders.items():
+        train = [samples[i] for i in order[n_test:]]
+        test = [samples[i] for i in order[:n_test]]
+        candidate, metrics, _, _ = _solve(train, K, dist, method)
+        errors = _reproject_errors(test, candidate, metrics.ee_from_board, K, dist)
+        rms = float(np.sqrt(np.mean(errors**2)))
+        _log.info(f"{label} holdout: {len(train)} train / {len(test)} test, {rms:.2f} px RMS")
+        if not np.isfinite(rms) or rms > max_rms_px:
+            raise RuntimeError(f"{label} held-out error {rms:.2f} px exceeds {max_rms_px:.2f} px. "
+                               "Collect more diverse poses or check target geometry/FK; samples are saved.")
 
 
 def _rotation_diversity_deg(samples: list[Sample]) -> float:
@@ -646,6 +733,153 @@ def _rotation_diversity_deg(samples: list[Sample]) -> float:
     rots = Rot.from_matrix(np.stack([s.world_from_ee[:3, :3] for s in samples]))
     angles = [(rots[i].inv() * rots[j]).magnitude() for i in range(len(samples)) for j in range(i + 1, len(samples))]
     return float(np.degrees(max(angles))) if angles else 0.0
+
+
+# --------------------------------------------------------------------------------------------- #
+# Live view                                                                                       #
+# --------------------------------------------------------------------------------------------- #
+# The ports YAM.md's SSH tunnel already forwards for tiptop-run: Rerun's web viewer and its gRPC proxy.
+LIVE_VIEW_CONNECT_URL = "rerun+http://127.0.0.1:9876/proxy"
+LIVE_VIEW_WEB_PORT = 9090
+LIVE_VIEW_HZ = 10.0
+
+
+def _port_open(host: str, port: int) -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _stop_rerun_server(server: subprocess.Popen) -> None:
+    # ``python -m rerun`` is a wrapper around the real binary, which outlives a plain terminate();
+    # the server leads its own session, so signalling its process group reaches both.
+    os.killpg(server.pid, signal.SIGTERM)
+    server.wait(timeout=5.0)
+
+
+def _spawn_rerun_server(grpc_port: int, web_port: int, log_path: Path) -> subprocess.Popen | None:
+    """Start the same localhost-only Rerun web server YAM.md runs for tiptop-run; None if it never came up.
+
+    Not the SDK's ``serve_web_viewer``, which binds every interface and would put the camera on the
+    lab network. It gets its own session so the Ctrl-C that ends ``manual`` capture does not kill it.
+    """
+    cmd = [
+        sys.executable, "-m", "rerun", "--serve-web", "--bind", "127.0.0.1", "--port", str(grpc_port),
+        "--web-viewer-port", str(web_port), "--server-memory-limit", "1GB",
+    ]  # fmt: skip
+    with open(log_path, "wb") as log:
+        server = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    deadline = time.time() + 15.0
+    while time.time() < deadline and server.poll() is None:
+        if _port_open("127.0.0.1", grpc_port) and _port_open("127.0.0.1", web_port):
+            return server
+        time.sleep(0.2)
+    _stop_rerun_server(server)
+    _log.warning(f"The Rerun server for the live view did not start (see {log_path}); carrying on without it")
+    return None
+
+
+def _draw_live_view(
+    bgr: np.ndarray, solved: tuple | None, K, dist, min_corners: int, max_incidence_deg: float, min_coverage: float
+) -> np.ndarray:
+    """The frame with the detection and the same verdict the capture gates give, so you can see what to fix."""
+    if solved is None:
+        out, status, good = bgr.copy(), "no board detected", False
+    else:
+        obj_pts, img_pts, cam_from_board, err, incidence, coverage = solved
+        out = _draw_detection(bgr, img_pts, cam_from_board, K, dist)
+        problems = _verdict(len(obj_pts), incidence, coverage, min_corners, max_incidence_deg, min_coverage)
+        status = (
+            f"{len(obj_pts)} corners, incidence {incidence:.0f} deg, coverage {coverage * 100:.0f}%, "
+            f"{err:.2f} px -> {'GOOD' if not problems else ' | '.join(problems)}"
+        )
+        good = not problems
+    wanted = (
+        f"wanted: >= {min_corners} corners, incidence < {max_incidence_deg:.0f} deg, "
+        f"coverage > {min_coverage * 100:.0f}%"
+    )
+    for row, (text, colour) in enumerate([(status, (0, 200, 0) if good else (0, 0, 255)), (wanted, (255, 255, 255))]):
+        origin = (15, 35 + 35 * row)
+        cv2.putText(out, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5)
+        cv2.putText(out, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
+    return out
+
+
+def _start_live_view(
+    read_frame: Callable,
+    K: np.ndarray,
+    dist: np.ndarray,
+    *,
+    spec: BoardSpec,
+    board,
+    run_dir: Path,
+    min_corners: int,
+    max_incidence_deg: float,
+    min_coverage: float,
+) -> Callable[[], None]:
+    """Stream the top camera, detection drawn on, to a Rerun web viewer; returns how to stop it.
+
+    Runs on its own thread, so the picture stays live while the main thread waits on the arm, the
+    planner or the keyboard. The camera serialises reads, so this and the capture loop take turns.
+
+    Streams to the Rerun server on ``TIPTOP_RERUN_CONNECT_URL`` (default 127.0.0.1:9876), starting
+    one there if nothing is listening — either way the tunnel YAM.md opens for tiptop-run reaches it.
+    """
+    connect_url = os.environ.get("TIPTOP_RERUN_CONNECT_URL", "").strip() or LIVE_VIEW_CONNECT_URL
+    target = urlparse(connect_url)
+    grpc_port = target.port or 9876
+    web_port = int(os.environ.get("TIPTOP_RERUN_WEB_PORT", LIVE_VIEW_WEB_PORT))
+
+    server = None
+    if not _port_open(target.hostname, grpc_port):
+        server = _spawn_rerun_server(grpc_port, web_port, run_dir / "rerun_server.log")
+        if server is None:
+            return lambda: None
+
+    rr.init("calibrate_top_cam", recording_id=run_dir.name)
+    rr.set_sinks(rr.GrpcSink(connect_url))
+    rr.send_blueprint(rrb.Blueprint(rrb.Spatial2DView(origin="top_cam", name="Top camera"), collapse_panels=True))
+
+    stop = threading.Event()
+
+    def stream() -> None:
+        while not stop.is_set():
+            started = time.time()
+            try:
+                bgr = read_frame().bgr
+                solved = solve_observation(bgr, spec, board, K, dist)
+                out = _draw_live_view(bgr, solved, K, dist, min_corners, max_incidence_deg, min_coverage)
+                _, jpeg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                rr.log("top_cam", rr.EncodedImage(contents=jpeg.tobytes(), media_type="image/jpeg"))
+            except Exception as e:
+                # A dropped frame should cost one picture, not the view, let alone the calibration.
+                _log.warning(f"live view: {e}")
+                stop.wait(1.0)
+            stop.wait(max(0.0, 1.0 / LIVE_VIEW_HZ - (time.time() - started)))
+
+    thread = threading.Thread(target=stream, name="top-cam-live-view", daemon=True)
+    thread.start()
+
+    # The address you ssh'd to, which is what your laptop can reach; the hostname may not resolve there.
+    ssh = os.environ.get("SSH_CONNECTION", "").split()
+    host = ssh[2] if len(ssh) >= 3 else socket.gethostname()
+    _log.info("=" * 78)
+    _log.info(f"Top camera live view: http://localhost:{web_port}/?url={quote(connect_url, safe='')}")
+    _log.info(
+        f"Over SSH, forward both ports from your laptop first: ssh -N -L {web_port}:127.0.0.1:{web_port} "
+        f"-L {grpc_port}:127.0.0.1:{grpc_port} {getpass.getuser()}@{host}"
+    )
+    _log.info("=" * 78)
+
+    def close() -> None:
+        stop.set()
+        thread.join(timeout=5.0)
+        # Flushed and closed while the server is still there, rather than erroring at interpreter exit.
+        rr.disconnect()
+        if server is not None:
+            _stop_rerun_server(server)
+
+    return close
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -703,6 +937,7 @@ class Rig:
     read_q: object  # () -> (6,) MEASURED joint positions
     fk: object  # ((6,)) -> 4x4 world_from_ee
     move_to_pose: object  # (4x4) -> bool, plan and execute; False if unreachable
+    move_to_q: object  # ((6,)) -> None, joint-space plan and execute; raises MotionPlanningError if unreachable
     set_free_drive: object  # (bool) -> None, hand-guidable arm with the gripper still clamped
     close: object  # () -> None
 
@@ -714,20 +949,25 @@ class Rig:
         """One frame with the board solved: ``(frame, obj_pts, img_pts, cam_from_board, err, incidence,
         coverage)``, or None if the board was not detected."""
         frame = self.read_frame()
-        detection = detect_board(frame.bgr, spec, board)
-        if detection is None:
-            return None
-        obj_pts, img_pts = detection
-        cam_from_board, err = solve_pnp(obj_pts, img_pts, self.K, self.dist)
-        incidence, coverage = presentation(cam_from_board, img_pts, frame.bgr.shape[:2][::-1])
-        return frame, obj_pts, img_pts, cam_from_board, err, incidence, coverage
+        solved = solve_observation(frame.bgr, spec, board, self.K, self.dist)
+        return None if solved is None else (frame, *solved)
 
 
-def _open_rig(*, flush_frames: int, time_dilation_factor: float, close_gripper: bool, warmup_iters: int) -> Rig:
+def _open_rig(
+    *,
+    flush_frames: int,
+    time_dilation_factor: float,
+    close_gripper: bool,
+    warmup_iters: int,
+    start_live_view: Callable,
+) -> Rig:
     """Open the camera, park the idle arm and build the motion planner.
 
     ``warmup_iters`` is 0 for ``manual``, which never plans a motion: cuRobo is built there only for
     its forward kinematics, and warming up the trajectory optimiser for that is pure waiting.
+
+    The live view starts as soon as the camera is open, so the board can be set up while the planner
+    builds; closing the rig stops it.
     """
     import torch
     from curobo.geom.types import WorldConfig
@@ -735,7 +975,7 @@ def _open_rig(*, flush_frames: int, time_dilation_factor: float, close_gripper: 
     from curobo.types.state import JointState
     from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
 
-    from tiptop.motion_planning import get_motion_gen
+    from tiptop.motion_planning import get_motion_gen, go_to_q
     from tiptop.perception.cameras import camera_mount, get_hand_camera
     from tiptop.utils import get_robot_client
     from tiptop.workspace import workspace_cuboids
@@ -752,6 +992,7 @@ def _open_rig(*, flush_frames: int, time_dilation_factor: float, close_gripper: 
     K = np.asarray(intrinsics.K_color, dtype=np.float64)
     dist = np.asarray(intrinsics.distortion_color, dtype=np.float64).reshape(-1, 1)
     _log.info(f"Camera {cam.serial}: fx={K[0, 0]:.2f} fy={K[1, 1]:.2f} cx={K[0, 2]:.2f} cy={K[1, 2]:.2f}")
+    stop_live_view = start_live_view(cam.read_camera, K, dist)
 
     client = get_robot_client()
     parked = client.park_idle_arm()
@@ -804,7 +1045,15 @@ def _open_rig(*, flush_frames: int, time_dilation_factor: float, close_gripper: 
             raise RuntimeError(f"could not move the arm: {exec_result.get('error')}")
         return True
 
-    return Rig(cam.serial, K, dist, read_frame, read_q, fk, move_to_pose, set_free_drive, cam.close)
+    def close() -> None:
+        # The view reads the camera, so it has to stop first.
+        stop_live_view()
+        cam.close()
+
+    def move_to_q(q_target) -> None:
+        go_to_q(np.asarray(q_target, dtype=np.float64), time_dilation_factor, motion_gen=motion_gen)
+
+    return Rig(cam.serial, K, dist, read_frame, read_q, fk, move_to_pose, move_to_q, set_free_drive, close)
 
 
 def _prior_world_from_cam(cam_serial: str) -> np.ndarray:
@@ -1070,6 +1319,48 @@ def _is_novel(world_from_ee: np.ndarray, samples: list[Sample], min_trans_mm: fl
     )
 
 
+def _capture_burst(
+    rig: Rig,
+    spec: BoardSpec,
+    board,
+    q: np.ndarray,
+    *,
+    still_rad: float,
+    max_pnp_error_px: float,
+    min_corners: int,
+    max_incidence_deg: float,
+    min_coverage: float,
+) -> tuple[tuple | None, bool]:
+    """One observation from a short burst at a held pose: ``(observed or None, arm moved meanwhile)``.
+
+    Median corners over a stationary burst suppress frame-to-frame detector noise. Only corners
+    present in every usable view are kept, in a consistent object-point order.
+    """
+    burst = []
+    moved = False
+    for _ in range(5):
+        observation = rig.observe(spec, board)
+        moved |= float(np.abs(rig.read_q() - q).max()) > still_rad
+        if observation is not None:
+            _, obj, _, _, err, incidence, coverage = observation
+            if err <= max_pnp_error_px and not _verdict(
+                len(obj), incidence, coverage, min_corners, max_incidence_deg, min_coverage
+            ):
+                burst.append(observation)
+    if len(burst) < 3:
+        return None, moved
+    maps = [{tuple(p): uv for p, uv in zip(o[1], o[2])} for o in burst]
+    common = sorted(set.intersection(*(set(m) for m in maps)))
+    if len(common) < min_corners:
+        return None, moved
+    obj = np.asarray(common, dtype=np.float64)
+    img = np.median(np.array([[m[p] for p in common] for m in maps]), axis=0)
+    pose, err = solve_pnp(obj, img, rig.K, rig.dist)
+    frame = burst[len(burst) // 2][0]
+    incidence, coverage = presentation(pose, img, frame.bgr.shape[:2][::-1])
+    return (frame, obj, img, pose, err, incidence, coverage), moved
+
+
 def _capture_manual(
     *,
     rig: Rig,
@@ -1087,7 +1378,7 @@ def _capture_manual(
     poll_s: float,
     run_dir: Path,
 ) -> list[Sample]:
-    """Let the OPERATOR move the board: the arm goes limp and every new, steady pose is captured.
+    """Explicit hand-guided capture: release with M, lock and record with R.
 
     The data is exactly what :func:`_capture_samples` gathers — the board still rides in the gripper,
     so FK of the measured joints still says where it is, and the eye-to-hand solve is unchanged. Only
@@ -1100,35 +1391,67 @@ def _capture_manual(
     no residual would reveal. Hence the dwell, and the re-check afterwards that the arm did not stir
     during the capture itself.
     """
+    from tiptop.config import tiptop_cfg
+    from tiptop.yam import arm_of
+
     frames_dir = run_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    rig.set_free_drive(True)
-    _log.info("=" * 78)
-    _log.info(
-        f"The arm is now LIMP — take hold of it and move the board around. Up to {num_poses} poses; "
-        f"each is captured on its own once you hold still for {still_s:.1f} s somewhere new. TURN "
-        "the board as well as sliding it: the solve needs rotation, and a pure translation sweep "
-        "cannot constrain the camera's orientation at all. Ctrl-C stops and solves with what you have."
-    )
-    _log.info("=" * 78)
+    rig.set_free_drive(False)
+    _log.info("Manual controls (then Enter): M = release to move, R/Enter = LOCK and record, "
+              "D = delete last, L = list, Q = finish. Arm starts locked and stays locked after R, "
+              "including rejected captures. Support the arm before M. Live view stays running.")
 
     samples: list[Sample] = []
-    anchor_q, moved_at, last_report = rig.read_q(), time.time(), 0.0
+    records: list[dict] = []
+
+    def persist():
+        (run_dir / "manual_poses.json").write_text(json.dumps(records, indent=2))
+        if samples:
+            _save_samples(run_dir, samples, rig.K, rig.dist, spec, rig.serial)
+        else:
+            (run_dir / "samples.npz").unlink(missing_ok=True)
+
     try:
         while len(samples) < num_poses:
-            time.sleep(poll_s)
-            q = rig.read_q()
-            if float(np.abs(q - anchor_q).max()) > still_rad:
-                anchor_q, moved_at = q, time.time()
+            command = input(f"[{len(samples)}/{num_poses}] M/R/D/L/Q > ").strip().lower()
+            if command == "m":
+                rig.set_free_drive(True)
                 continue
-            if time.time() - moved_at < still_s:
+            # Every other action locks first, including quit and invalid input.
+            rig.set_free_drive(False)
+            if command == "q":
+                break
+            if command == "d":
+                if samples:
+                    removed = samples.pop()
+                    records.pop()
+                    for suffix in (".png", "_detected.png"):
+                        (frames_dir / f"{removed.index:03d}{suffix}").unlink(missing_ok=True)
+                    persist()
+                continue
+            if command == "l":
+                for record in records:
+                    _log.info(f"Pose {record['index']}: joints {np.round(record['joints'], 4)}")
+                continue
+            if command not in ("", "r"):
+                _log.info("Use M/R/D/L/Q followed by Enter")
+                continue
+
+            time.sleep(still_s)
+            q = rig.read_q()
+            time.sleep(poll_s)
+            if float(np.abs(rig.read_q() - q).max()) > still_rad:
+                _log.info("Arm is still settling; remains locked. R to retry.")
                 continue
 
             world_from_ee = rig.fk(q)
-            observed = rig.observe(spec, board)
+            observed, moved_during_burst = _capture_burst(
+                rig, spec, board, q, still_rad=still_rad, max_pnp_error_px=max_pnp_error_px,
+                min_corners=min_corners, max_incidence_deg=max_incidence_deg, min_coverage=min_coverage,
+            )  # fmt: skip
             if observed is None:
-                reject = "no board detected — is your hand covering it?"
+                reject = "need at least 3 good burst frames with enough shared corners"
             else:
                 frame, obj_pts, img_pts, cam_from_board, pnp_err, incidence, coverage = observed
                 problems = _verdict(len(obj_pts), incidence, coverage, min_corners, max_incidence_deg, min_coverage)
@@ -1141,19 +1464,26 @@ def _capture_manual(
                         f"too close to a pose already captured — move it {min_new_trans_mm:.0f} mm "
                         f"or turn it {min_new_rot_deg:.0f} deg"
                     )
-                elif float(np.abs(rig.read_q() - q).max()) > still_rad:
+                elif moved_during_burst or float(np.abs(rig.read_q() - q).max()) > still_rad:
                     reject = "the arm moved while the frame was being taken"
                 else:
                     reject = None
 
             if reject is not None:
-                if time.time() - last_report > 1.5:
-                    _log.info(f"[{len(samples)}/{num_poses}] held still, but: {reject}")
-                    last_report = time.time()
+                _log.info(f"Rejected: {reject}. Arm remains locked; R retries, M releases.")
                 continue
 
             sample = Sample(len(samples), world_from_ee, cam_from_board, obj_pts, img_pts, pnp_err)
             samples.append(sample)
+            records.append(
+                {
+                    "index": sample.index,
+                    "arm": arm_of(tiptop_cfg().robot.type),
+                    "joints": np.asarray(q).tolist(),
+                    "world_from_ee": world_from_ee.tolist(),
+                    "timestamp": time.time(),
+                }
+            )
             cv2.imwrite(str(frames_dir / f"{sample.index:03d}.png"), frame.bgr)
             cv2.imwrite(
                 str(frames_dir / f"{sample.index:03d}_detected.png"),
@@ -1165,13 +1495,132 @@ def _capture_manual(
                 f"{incidence:.0f} deg, coverage {coverage * 100:.0f}%, {pnp_err:.2f} px. Rotation "
                 f"spread so far {_rotation_diversity_deg(samples):.0f} deg"
             )
-            last_report = time.time()
-    except KeyboardInterrupt:
+            persist()
+    except (KeyboardInterrupt, EOFError):
         _log.info(f"Stopped by hand with {len(samples)} samples")
     finally:
         rig.set_free_drive(False)
         _log.info("The arm is holding position again")
 
+    return samples
+
+
+def _load_taught_poses(path: Path, arm: str) -> list[np.ndarray]:
+    """Joint configurations recorded by ``manual``, from its run directory or its manual_poses.json."""
+    path = Path(path)
+    if path.is_dir():
+        path = path / "manual_poses.json"
+    records = json.loads(path.read_text())
+    if not records:
+        raise ValueError(f"{path} has no poses; record some with --mode manual first")
+    taught = {r.get("arm") for r in records} - {None}
+    if taught and taught != {arm}:
+        # The two arms are mirror images, so one arm's joint angles put the other somewhere else entirely.
+        raise ValueError(f"{path} was taught on the {'/'.join(sorted(taught))} arm, not --arm {arm}")
+    if not taught:
+        _log.warning(f"{path} predates per-pose arm records; make sure it was taught on the {arm} arm")
+    poses = [np.asarray(r["joints"], dtype=np.float64) for r in records]
+    if any(q.shape != (6,) for q in poses):
+        raise ValueError(f"{path} has a pose that is not 6 joint angles")
+    return poses
+
+
+def _wait_until_still(rig: Rig, still_rad: float, still_s: float, poll_s: float, timeout_s: float) -> np.ndarray | None:
+    """The joints once they have stayed within ``still_rad`` for ``still_s``; None if not within ``timeout_s``.
+
+    A trajectory's last waypoint is not the end of the motion: the PD loop overshoots and rings for a
+    moment, and a burst taken during that is rejected as the arm having moved.
+    """
+    deadline = time.monotonic() + timeout_s
+    anchor, since = rig.read_q(), time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(poll_s)
+        q = rig.read_q()
+        if float(np.abs(q - anchor).max()) > still_rad:
+            anchor, since = q, time.monotonic()
+        elif time.monotonic() - since >= still_s:
+            return q
+    return None
+
+
+def _capture_playback(
+    *,
+    rig: Rig,
+    spec: BoardSpec,
+    board,
+    poses: list[np.ndarray],
+    still_s: float,
+    poll_s: float,
+    still_rad: float,
+    max_pnp_error_px: float,
+    min_corners: int,
+    max_incidence_deg: float,
+    min_coverage: float,
+    run_dir: Path,
+) -> list[Sample]:
+    """Drive the arm back through joint configurations taught in ``manual`` and capture at each.
+
+    Teaching by hand picks poses the camera sees well; playing them back takes the hands off the arm
+    for the capture itself, so nothing pushes on the board while its frames are taken. Every move is
+    planned in JOINT space to the exact taught configuration, so there is no IK to land on a different
+    solution than the one that was taught. FK uses the joints measured on arrival, not the taught ones.
+    """
+    from tiptop.motion_planning import MotionPlanningError
+
+    frames_dir = run_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    _log.warning(
+        "The board is NOT in the collision model. Keep the workspace clear — the arm is about to move "
+        f"through {len(poses)} taught poses. Ctrl-C stops and solves with what has been captured."
+    )
+
+    samples: list[Sample] = []
+    try:
+        for i, q_taught in enumerate(poses):
+            try:
+                rig.move_to_q(q_taught)
+            except MotionPlanningError:
+                _log.info(f"[{i + 1}/{len(poses)}] no collision-free plan to this pose; skipping")
+                continue
+            q = _wait_until_still(rig, still_rad, still_s, poll_s, SETTLE_TIMEOUT_S)
+            if q is None:
+                _log.info(
+                    f"[{i + 1}/{len(poses)}] the arm did not hold within {still_rad} rad for {still_s:.1f} s "
+                    f"inside {SETTLE_TIMEOUT_S:.0f} s; skipping"
+                )
+                continue
+            world_from_ee = rig.fk(q)
+            observed, moved = _capture_burst(
+                rig, spec, board, q, still_rad=still_rad, max_pnp_error_px=max_pnp_error_px,
+                min_corners=min_corners, max_incidence_deg=max_incidence_deg, min_coverage=min_coverage,
+            )  # fmt: skip
+            if observed is None:
+                reject = "need at least 3 good burst frames with enough shared corners"
+            elif moved:
+                reject = "the arm moved while the frames were being taken"
+            else:
+                frame, obj_pts, img_pts, cam_from_board, pnp_err, incidence, coverage = observed
+                problems = _verdict(len(obj_pts), incidence, coverage, min_corners, max_incidence_deg, min_coverage)
+                if pnp_err > max_pnp_error_px:
+                    problems.append(f"PnP error {pnp_err:.2f} px over {max_pnp_error_px}")
+                reject = " | ".join(problems) or None
+            if reject is not None:
+                _log.info(f"[{i + 1}/{len(poses)}] {reject}; skipping")
+                continue
+
+            sample = Sample(len(samples), world_from_ee, cam_from_board, obj_pts, img_pts, pnp_err)
+            samples.append(sample)
+            cv2.imwrite(str(frames_dir / f"{sample.index:03d}.png"), frame.bgr)
+            cv2.imwrite(
+                str(frames_dir / f"{sample.index:03d}_detected.png"),
+                _draw_detection(frame.bgr, img_pts, cam_from_board, rig.K, rig.dist),
+            )
+            _log.info(
+                f"[{i + 1}/{len(poses)}] captured sample {sample.index}: {len(obj_pts)} corners, "
+                f"incidence {incidence:.0f} deg, coverage {coverage * 100:.0f}%, {pnp_err:.2f} px"
+            )
+    except KeyboardInterrupt:
+        _log.info(f"Stopped by hand with {len(samples)} samples")
     return samples
 
 
@@ -1305,31 +1754,52 @@ def _write_aim_image(rig: Rig, spec: BoardSpec, board, run_dir: Path) -> None:
 
 
 def _capture_static(
-    *, spec: BoardSpec, board, world_from_board: np.ndarray, num_frames: int, flush_frames: int, run_dir: Path
+    *,
+    spec: BoardSpec,
+    board,
+    world_from_board: np.ndarray,
+    num_frames: int,
+    flush_frames: int,
+    run_dir: Path,
+    start_live_view: Callable,
+    wait_for_enter: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, float]:
-    """Average ``cam_from_board`` over a burst of frames and invert through the known board pose."""
+    """Average ``cam_from_board`` over a burst of frames and invert through the known board pose.
+
+    ``wait_for_enter`` holds the burst until you have checked the board in the live view; without it
+    the burst is over before there is anything to look at.
+    """
     from tiptop.perception.cameras import get_hand_camera
 
     cam = get_hand_camera()
     intrinsics = cam.get_intrinsics()
     K = np.asarray(intrinsics.K_color, dtype=np.float64)
     dist = np.asarray(intrinsics.distortion_color, dtype=np.float64).reshape(-1, 1)
+    stop_live_view = start_live_view(cam.read_camera, K, dist)
 
     poses, errors = [], []
-    for _ in range(num_frames):
-        for _ in range(max(0, flush_frames - 1)):
-            cam.read_camera()
-        frame = cam.read_camera()
-        detection = detect_board(frame.bgr, spec, board)
-        if detection is None:
-            continue
-        obj_pts, img_pts = detection
-        cam_from_board, err = solve_pnp(obj_pts, img_pts, K, dist)
-        poses.append(cam_from_board)
-        errors.append(err)
-        cv2.imwrite(
-            str(run_dir / f"static_{len(poses):02d}.png"), _draw_detection(frame.bgr, img_pts, cam_from_board, K, dist)
-        )
+    try:
+        if wait_for_enter:
+            _log.info("Check the board in the live view, then press Enter here to capture.")
+            input()
+        for _ in range(num_frames):
+            for _ in range(max(0, flush_frames - 1)):
+                cam.read_camera()
+            frame = cam.read_camera()
+            detection = detect_board(frame.bgr, spec, board)
+            if detection is None:
+                continue
+            obj_pts, img_pts = detection
+            cam_from_board, err = solve_pnp(obj_pts, img_pts, K, dist)
+            poses.append(cam_from_board)
+            errors.append(err)
+            cv2.imwrite(
+                str(run_dir / f"static_{len(poses):02d}.png"),
+                _draw_detection(frame.bgr, img_pts, cam_from_board, K, dist),
+            )
+    finally:
+        stop_live_view()
+        cam.close()
 
     if not poses:
         raise RuntimeError(f"the {spec.kind} board was never detected; check lighting and that it is in view")
@@ -1339,7 +1809,6 @@ def _capture_static(
     mean[:3, :3] = Rot.from_matrix(stacked[:, :3, :3]).mean().as_matrix()
     mean[:3, 3] = stacked[:, :3, 3].mean(axis=0)
     _log.info(f"Averaged {len(poses)} detections; PnP error {np.mean(errors):.2f} px")
-    cam.close()
     return world_from_board @ np.linalg.inv(mean), K, dist, cam.serial, float(np.mean(errors))
 
 
@@ -1422,7 +1891,7 @@ def _report(world_from_cam: np.ndarray, metrics: Metrics | None, samples: list[S
 # --------------------------------------------------------------------------------------------- #
 def calibrate_top_cam(
     arm: Literal["left", "right"] = "left",
-    mode: Literal["handeye", "manual", "static", "aim", "sweep"] = "handeye",
+    mode: Literal["handeye", "manual", "playback", "static", "aim", "sweep"] = "handeye",
     board_kind: BoardKind = "charuco",
     cols: int | None = None,
     rows: int | None = None,
@@ -1444,18 +1913,20 @@ def calibrate_top_cam(
     min_coverage: float = 0.25,
     aim_seconds: float = 120.0,
     auto_aim_steps: int = 12,
-    still_rad: float = 0.01,
+    still_rad: float = 0.002,
     still_s: float = 1.0,
     min_new_trans_mm: float = 30.0,
     min_new_rot_deg: float = 8.0,
     poll_s: float = 0.05,
-    outlier_px: float = 4.0,
+    outlier_px: float = 8.0,
     close_gripper: bool = False,
     board_pose: tuple[float, float, float, float, float, float] | None = None,
     static_frames: int = 10,
     holdout_test_fraction: float = 0.3,
     replay: Path | None = None,
+    poses: Path | None = None,
     save: bool = True,
+    live_view: bool = True,
 ):
     """Solve and store ``world_from_cam`` for the YAM's fixed third-person camera.
 
@@ -1465,7 +1936,9 @@ def calibrate_top_cam(
             same gripper, but the arm goes limp and you hand-guide it), ``static`` (board at a known
             world pose), ``aim`` — turn the wrist until the board faces the camera, then stop
             without calibrating — or ``sweep`` — you hand-guide it to a starting pose and press
-            Enter, then the arm sweeps it through a DROID-style Lissajous loop around that pose.
+            Enter, then the arm sweeps it through a DROID-style Lissajous loop around that pose —
+            or ``playback`` — the arm moves itself back through the poses a ``manual`` run recorded
+            (see ``--poses``) and captures at each, with nobody touching it.
         board_kind: ``charuco`` is strongly preferred — it survives partial occlusion and is not
             rotationally ambiguous, both of which matter when the gripper covers part of the board.
         cols: Board width. SQUARES for charuco (default 14), INNER CORNERS for chessboard (default 9).
@@ -1474,10 +1947,10 @@ def calibrate_top_cam(
             the most common reason a calibration comes out with the right rotation and wrong depth.
         marker_size: ArUco marker edge length, metres. Charuco only.
         num_poses: How many poses to attempt. Unreachable ones and frames with no detection are
-            skipped, so the number of samples is lower. In ``manual`` it is where the capture stops
-            on its own; Ctrl-C ends it earlier and solves with what has been collected. In ``sweep``
+            skipped, so the number of samples is lower. In ``manual`` it is the capture limit;
+            Q or Ctrl-C ends it earlier and solves with what has been collected. In ``sweep``
             it is how many points are sampled along the one Lissajous loop.
-        min_samples: Refuse to solve with fewer than this many samples.
+        min_samples: Refuse to solve with fewer than this many samples (at least 6).
         pos_scale: Half-width of the translation perturbation box, metres in ``handeye``; the
             Lissajous loop's translation amplitude, metres, in ``sweep``.
         rot_scale_deg: Maximum orientation perturbation, degrees, in ``handeye``; the Lissajous
@@ -1497,22 +1970,31 @@ def calibrate_top_cam(
         auto_aim_steps: How many servo steps to allow when turning the board to face the camera. 0
             turns automatic aiming off — the run then fails on a poorly presented board instead of
             fixing it. Not used by ``manual``, which never moves the arm.
-        still_rad: ``manual`` only. How far any joint may wander and still count as held still, and
-            the same tolerance the arm must not exceed while a sample is being taken.
-        still_s: ``manual`` only. How long to hold a pose before it is captured.
+        still_rad: ``manual`` and ``playback``. Maximum joint drift during settling checks and the
+            image burst.
+        still_s: ``manual``: settling delay after R locks the joints, before the capture burst.
+            ``playback``: how long the arm must hold within ``still_rad`` after each move before it
+            captures (it waits up to ``SETTLE_TIMEOUT_S`` for that, then skips the pose).
         min_new_trans_mm: ``manual`` only. A pose counts as new if it is this far from every
             captured one, OR turned by ``min_new_rot_deg``. Being new in neither is a duplicate.
         min_new_rot_deg: ``manual`` only. The rotation half of the same test.
-        poll_s: ``manual`` only. How often the joints are read while waiting for you to settle.
+        poll_s: ``manual`` and ``playback``. How often the joints are read while waiting for the arm
+            to settle.
         outlier_px: Keep dropping the worst-reprojecting sample and re-solving until none exceeds
-            this, up to a third of the set.
+            this, up to a third of the set; also the held-out and final worst-pose acceptance limit.
+            For the YAM's top camera 1 px is about 1 mm on the table (fx ~909 at ~0.96 m). The arm's
+            own FK only agrees with the camera to ~5-7 mm, so much below 8 px rejects good runs.
         close_gripper: Close the gripper before moving, for a board clamped in the jaws.
         board_pose: ``static`` mode only — ``world_from_board`` as ``x y z roll pitch yaw``.
-        holdout_test_fraction: ``sweep`` mode only. Fraction of samples held out to check the solve
-            generalizes, DROID-style; ``--outlier-px`` doubles as the acceptance threshold for the
-            held-out RMS.
+        holdout_test_fraction: Fraction held out for random and spatial validation in every
+            moving-board mode; ``--outlier-px`` is also the held-out RMS acceptance threshold.
         replay: Re-solve from a previous run directory instead of touching hardware.
+        poses: ``playback`` only. A ``manual`` run directory (or its ``manual_poses.json``) whose
+            recorded joint configurations the arm visits, in the order they were taught.
         save: Write the result into the active workspace's calibration file.
+        live_view: Stream the top camera, with the board detection and capture verdict drawn on, to
+            a Rerun web viewer for the whole run; the URL and the SSH tunnel command are logged at
+            the start. ``static`` then waits for Enter before capturing, so there is time to look.
     """
     from tiptop.config import update_calibration_info, workspace_calib_path
     from tiptop.utils import get_tiptop_cache_dir
@@ -1530,9 +2012,16 @@ def calibrate_top_cam(
     spec.validate()
     if method != "auto" and method not in HAND_EYE_METHODS:
         raise ValueError(f"unknown hand-eye method {method!r}; expected 'auto' or one of {list(HAND_EYE_METHODS)}")
-    if mode == "sweep" and method == "auto":
-        method = "daniilidis"
-        _log.info("mode=sweep defaults --method to daniilidis, mirroring DROID's fixed method=4")
+    if not 0 < holdout_test_fraction < 1:
+        raise ValueError("holdout_test_fraction must be between 0 and 1")
+    if min_samples < 6 or num_poses < min_samples:
+        raise ValueError("Need num_poses >= min_samples >= 6")
+    if min(still_rad, still_s, poll_s, outlier_px) <= 0:
+        raise ValueError("Stillness tolerances, polling interval and outlier threshold must be positive")
+    if (mode == "playback") != (poses is not None) and replay is None:
+        raise ValueError("--poses goes with --mode playback, and --mode playback needs --poses <manual run dir>")
+    # Loaded before any hardware opens, so a wrong file fails fast instead of after the planner warms up.
+    taught = _load_taught_poses(poses, arm) if mode == "playback" and replay is None else None
     if spec.kind == "chessboard" and replay is None:
         _log.warning(
             "A plain chessboard needs the WHOLE grid visible in every frame and can order its "
@@ -1559,6 +2048,12 @@ def calibrate_top_cam(
         run_dir.mkdir(parents=True, exist_ok=True)
         _log.info(f"Run directory: {run_dir}")
         board = _charuco_board(spec) if spec.kind == "charuco" else None
+        gates = dict(min_corners=min_corners, max_incidence_deg=max_incidence_deg, min_coverage=min_coverage)
+
+        def start_live_view(read_frame: Callable, K: np.ndarray, dist: np.ndarray) -> Callable[[], None]:
+            if not live_view:
+                return lambda: None
+            return _start_live_view(read_frame, K, dist, spec=spec, board=board, run_dir=run_dir, **gates)
 
         if mode == "static":
             if board_pose is None:
@@ -1570,6 +2065,8 @@ def calibrate_top_cam(
                 num_frames=static_frames,
                 flush_frames=flush_frames,
                 run_dir=run_dir,
+                start_live_view=start_live_view,
+                wait_for_enter=live_view,
             )
             pose6 = _report(world_from_cam, None, [], cam_serial)
             _log.info(f"Static-mode PnP error: {pnp_px:.2f} px. Accuracy is bounded by --board-pose.")
@@ -1599,9 +2096,9 @@ def calibrate_top_cam(
                 # manual never plans a motion, so cuRobo is built for its kinematics alone.
                 # sweep plans one short move per Lissajous point, so it needs the planner warmed up.
                 warmup_iters=0 if mode == "manual" else 4,
+                start_live_view=start_live_view,
             )
             try:
-                gates = dict(min_corners=min_corners, max_incidence_deg=max_incidence_deg, min_coverage=min_coverage)
                 if mode == "manual":
                     # No aiming: aiming turns the wrist, and in this mode the wrist is yours.
                     samples = _capture_manual(
@@ -1615,6 +2112,20 @@ def calibrate_top_cam(
                         min_new_trans_mm=min_new_trans_mm,
                         min_new_rot_deg=min_new_rot_deg,
                         poll_s=poll_s,
+                        run_dir=run_dir,
+                        **gates,
+                    )
+                elif mode == "playback":
+                    # No aiming: the taught poses already present the board; aiming would move it off them.
+                    samples = _capture_playback(
+                        rig=rig,
+                        spec=spec,
+                        board=board,
+                        poses=taught,
+                        still_s=still_s,
+                        poll_s=poll_s,
+                        still_rad=still_rad,
+                        max_pnp_error_px=max_pnp_error_px,
                         run_dir=run_dir,
                         **gates,
                     )
@@ -1669,7 +2180,8 @@ def calibrate_top_cam(
                 K, dist, cam_serial = rig.K, rig.dist, rig.serial
             finally:
                 rig.close()
-        _save_samples(run_dir, samples, K, dist, spec, cam_serial)
+        if samples:
+            _save_samples(run_dir, samples, K, dist, spec, cam_serial)
 
     if len(samples) < min_samples:
         raise RuntimeError(
@@ -1689,8 +2201,7 @@ def calibrate_top_cam(
             "conditioned below ~20 deg — raise --rot-scale-deg and rerun."
         )
 
-    if mode == "sweep":
-        _holdout_check(samples, K, dist, method, holdout_test_fraction, outlier_px, seed)
+    _holdout_check(samples, K, dist, method, holdout_test_fraction, outlier_px, seed)
 
     world_from_cam, metrics, chosen, all_scored, samples = _solve_robust(
         samples, K, dist, method, outlier_px, min_samples
@@ -1712,7 +2223,7 @@ def calibrate_top_cam(
                 "method": chosen,
                 "pose": pose6.tolist(),
                 "world_from_cam": world_from_cam.tolist(),
-                "ee_from_board": _mean_offset(_board_offsets(samples, world_from_cam)).tolist(),
+                "ee_from_board": metrics.ee_from_board.tolist(),
                 "board": spec.to_json(),
                 "num_samples": len(samples),
                 "rotation_diversity_deg": diversity,
@@ -1726,11 +2237,9 @@ def calibrate_top_cam(
     )
     _log.info(f"Wrote {run_dir / 'result.json'} and {run_dir / 'verification.png'}")
 
-    if metrics.reproj_rms_px > outlier_px:
-        _log.warning(
-            f"{metrics.reproj_rms_px:.2f} px RMS is high for a calibration this constrained. Check "
-            "--square-size against the actual printout before trusting the result."
-        )
+    if not np.isfinite(metrics.reproj_max_px) or metrics.reproj_max_px > outlier_px:
+        raise RuntimeError(f"Final worst-pose error {metrics.reproj_max_px:.2f} px exceeds "
+                           f"{outlier_px:.2f} px; calibration not installed. Check board scale/FK.")
     if save:
         update_calibration_info(cam_serial, pose6)
     else:

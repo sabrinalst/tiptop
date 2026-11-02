@@ -21,7 +21,7 @@ class RealsenseFrame(Frame):
 
     ir_left: UInt8[np.ndarray, "h w"] | None = None  # IR left uint8
     ir_right: UInt8[np.ndarray, "h w"] | None = None  # IR right uint8
-    depth_raw: UInt16[np.ndarray, "h w"] | None = None  # Raw depth uint16 millimeters
+    depth_raw: UInt16[np.ndarray, "h w"] | None = None  # Raw depth uint16, in sensor units (not always mm)
 
 
 @dataclass(frozen=True)
@@ -51,39 +51,73 @@ class RealsenseCamera:
         self._enable_depth = enable_depth
         self._enable_ir = enable_ir
         self._read_lock = threading.Lock()
+        self._stream_cfg = (width, height, fps)
 
-        # Enable streams
-        config = rs.config()
         if serial is not None:
-            config.enable_device(serial)
             _log.info(f"Configuring RealSense camera {serial}")
         else:
             _log.info(f"Configuring RealSense camera (first available)")
-
-        config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
-        if enable_depth:
-            config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-        if enable_ir:
-            config.enable_stream(rs.stream.infrared, 1, width, height, rs.format.y8, fps)
-            config.enable_stream(rs.stream.infrared, 2, width, height, rs.format.y8, fps)
-
-        # Start pipeline
-        self.pipeline = rs.pipeline()
-        self._profile = self.pipeline.start(config)
-        for _ in range(30):
-            self.pipeline.wait_for_frames()
+        self._start_pipeline(serial)
 
         # Get camera serial number
         device = self._profile.get_device()
         self.serial = device.get_info(rs.camera_info.serial_number)
 
-        # Cache the intrinsics call. Skipped for a record-only camera, which has no IR streams and
-        # therefore no stereo intrinsics to compute.
+        # Metres per depth unit differs by model: 1 mm on the D435, 0.1 mm on the D405.
+        self._depth_scale = device.first_depth_sensor().get_depth_scale() if enable_depth else None
+
+        # Cache the intrinsics now: asking the device for them later fails once it is unplugged.
+        # A record-only camera has no IR streams, hence no stereo intrinsics, only the colour matrix.
         if enable_ir:
             self.get_intrinsics()
+        else:
+            self._color_matrix()
 
         init_dur = time.perf_counter() - start_time
         _log.info(f"Realsense camera (s/n: {self.serial}) initialization complete, took {init_dur:.2f}s")
+
+    def _start_pipeline(self, serial: str | None):
+        """Open the configured streams on ``serial`` (or the first device) and discard the warm-up frames."""
+        import pyrealsense2 as rs
+
+        width, height, fps = self._stream_cfg
+        config = rs.config()
+        if serial is not None:
+            config.enable_device(serial)
+        config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
+        if self._enable_depth:
+            config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+        if self._enable_ir:
+            config.enable_stream(rs.stream.infrared, 1, width, height, rs.format.y8, fps)
+            config.enable_stream(rs.stream.infrared, 2, width, height, rs.format.y8, fps)
+        self.pipeline = rs.pipeline()
+        self._profile = self.pipeline.start(config)
+        for _ in range(30):
+            self.pipeline.wait_for_frames()
+
+    def _wait_for_reconnect(self, error: Exception):
+        """Block until the camera is back and streaming again; only Ctrl-C ends the wait."""
+        import pyrealsense2 as rs
+
+        _log.error(f"RealSense camera {self.serial} disconnected ({error}). Check its USB cable and connection.")
+        try:
+            self.pipeline.stop()
+        except RuntimeError:
+            pass
+        waited = 0
+        while True:
+            time.sleep(1.0)
+            waited += 1
+            present = {d.get_info(rs.camera_info.serial_number) for d in rs.context().query_devices()}
+            if self.serial in present:
+                try:
+                    self._start_pipeline(self.serial)
+                    _log.info(f"RealSense camera {self.serial} reconnected after ~{waited}s")
+                    return
+                except RuntimeError as e:
+                    _log.warning(f"Camera {self.serial} is visible but would not start ({e}); retrying")
+            if waited % 5 == 0:
+                _log.warning(f"Still waiting for RealSense camera {self.serial}: check the connection (Ctrl-C to quit)")
 
     @cache
     def get_intrinsics(self) -> RealsenseIntrinsics:
@@ -156,12 +190,18 @@ class RealsenseCamera:
         # burst from the same camera partway through. librealsense's pipeline is not safe for
         # concurrent wait_for_frames, so without this the two steal each other's frames or fault.
         # Under the lock they simply alternate, and each still gets whole, valid frames.
+        # A device error (cable pulled, USB reset) blocks here until the camera is back, so a
+        # rollout resumes rather than dying; the lock is held meanwhile, which parks the other reader.
         with self._read_lock:
-            frames = self.pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
-            rgb = np.asanyarray(color_frame.get_data())
-            timestamp = frames.get_timestamp()
-            return self._build_frame(frames, rgb, timestamp, rs)
+            while True:
+                try:
+                    frames = self.pipeline.wait_for_frames()
+                    color_frame = frames.get_color_frame()
+                    rgb = np.asanyarray(color_frame.get_data())
+                    timestamp = frames.get_timestamp()
+                    return self._build_frame(frames, rgb, timestamp, rs)
+                except RuntimeError as e:
+                    self._wait_for_reconnect(e)
 
     def _build_frame(self, frames, rgb, timestamp, rs) -> RealsenseFrame:
         """Turn one grabbed frameset into a RealsenseFrame. Called with the read lock held."""
@@ -182,11 +222,11 @@ class RealsenseCamera:
             depth_frame = frames.get_depth_frame()
             depth_raw = np.asanyarray(depth_frame.get_data())
 
-            # Get aligned depth and convert mm to m
+            # Get aligned depth and convert sensor units to m
             align = rs.align(rs.stream.color)
             aligned_frames = align.process(frames)
             aligned_depth_frame = aligned_frames.get_depth_frame()
-            depth_float = (np.asanyarray(aligned_depth_frame.get_data()) / 1000.0).astype(np.float32)
+            depth_float = (np.asanyarray(aligned_depth_frame.get_data()) * self._depth_scale).astype(np.float32)
 
         return RealsenseFrame(
             serial=self.serial,

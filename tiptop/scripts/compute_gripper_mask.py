@@ -4,7 +4,7 @@ import logging
 
 import cv2
 import numpy as np
-from tiptop.perception.gemini import gemini_client, load_json
+from tiptop.perception.gemini import DEFAULT_GEMINI_MODEL, gemini_client, load_json
 from PIL import Image
 from scipy.ndimage import binary_dilation, binary_fill_holes
 
@@ -23,7 +23,7 @@ The format should be as follows: [{"box_2d": [ymin, xmin, ymax, xmax], "label": 
 0-1000. The values in box_2d must only be integers""".strip()
 
 
-def compute_gripper_mask(gemini_model: str = "gemini-robotics-er-1.6-preview", dilation_iters: int = 8):
+def compute_gripper_mask(gemini_model: str = DEFAULT_GEMINI_MODEL, dilation_iters: int = 8):
     """
     Compute gripper mask using Gemini detection and SAM segmentation.
 

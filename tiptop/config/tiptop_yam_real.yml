@@ -33,10 +33,9 @@ robot:
   # Set to [left] (or [right]) to collect with one arm; the other is then only parked and recorded.
   arms: [left, right]
 
-  # Midline the object split uses, in the URDF `world` frame. The base column is mounted at
-  # (0.24, 0, 0.0551) with the left arm at y = +0.24 and the right at y = -0.24
-  # (cutamp/robots/assets/yam_description/bimanual_yam.urdf), so objects at y >= this go to the left
-  # arm. Matches MOUNT_XYZ[1] in the sim environment.
+  # Midline the object split uses, in the URDF `world` frame. The world origin is midway between the two
+  # arm bases, with +y toward the left arm (placement from raiden's calibration: cutamp/robots/assets/
+  # yam_description/rig.json), so the midline is exactly y = 0 and objects at y >= this go to the left arm.
   base_y: 0.0
 
   # yam_arm_server.py. Same port layout as the Franka's bamboo shim so the client code is shared:
@@ -68,8 +67,9 @@ cameras:
   #
   # mount: world means its calibration entry IS world_from_cam, read straight out of
   # calibration_info_<workspace>.json and NOT composed with forward kinematics. Add an entry keyed
-  # by this serial, as [x, y, z, roll, pitch, yaw] in the URDF `world` frame — whose origin is
-  # 0.24 m in -x from the base column and 0.0551 m below its mounting face.
+  # by this serial, as [x, y, z, roll, pitch, yaw] in the URDF `world` frame — whose origin is midway
+  # between the two arm bases (x forward, +y toward the left arm), 0.0451 m below the underside of the
+  # bases. scripts/raiden_tiptop_calib_cvt.py writes it from raiden's calibration.
   hand:
     serial: "${oc.env:TIPTOP_TOP_CAMERA_ID,254622075770}"
     type: realsense
@@ -82,7 +82,7 @@ cameras:
   # the IR pair exists to feed FoundationStereo, and three IR pairs on one USB controller is what
   # pushes a D405 down to USB-2 and loses the mode entirely.
   external:
-    serial: "${oc.env:TIPTOP_LEFT_WRIST_CAMERA_ID,218622279640}"
+    serial: "${oc.env:TIPTOP_LEFT_WRIST_CAMERA_ID,261022277736}"
     type: realsense
     width: 640
     height: 360

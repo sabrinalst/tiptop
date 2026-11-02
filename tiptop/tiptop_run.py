@@ -120,6 +120,25 @@ TABLE_PLACEMENT_RAISE = TABLE_BOX_CLEARANCE
 _executor_pool = None
 
 
+def _hold_worker(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _start_save_pool() -> ProcessPoolExecutor:
+    """Create the save pool with all its workers already forked.
+
+    ProcessPoolExecutor forks lazily, on first use -- which would be mid-rollout, with the video
+    recorders' ffmpeg stdin pipes open. A forked worker inherits them, so ffmpeg never sees EOF when
+    the recorder closes its end, and the episode hangs at the end of recording. Occupying every worker
+    at once forces all of them to fork here, before any recording exists.
+    """
+    n_workers = 4
+    pool = ProcessPoolExecutor(max_workers=n_workers, initializer=_init_pool_worker)
+    for fut in [pool.submit(_hold_worker, 0.3) for _ in range(n_workers)]:
+        fut.result()
+    return pool
+
+
 def _init_pool_worker() -> None:
     """Set up a save-worker process.
 
@@ -926,6 +945,11 @@ async def run_perception(
 
     # Save results (ProcessPoolExecutor for live mode, default thread pool for h5 mode)
     loop = asyncio.get_running_loop()
+    global _executor_pool
+    if getattr(_executor_pool, "_broken", False):
+        _log.warning("Save-worker pool is broken (a worker died); starting a new one")
+        _executor_pool.shutdown(wait=False, cancel_futures=True)
+        _executor_pool = _start_save_pool()
     save_future = loop.run_in_executor(
         _executor_pool,
         save_perception_outputs,
@@ -2253,7 +2277,7 @@ def _sync_entrypoint(
     # guarantees they never outlive us. Do NOT switch this to forkserver/spawn to dodge the
     # inheritance: those re-import this module in each worker, and importing it initialises CUDA,
     # giving every worker its own ~600MB context -- strictly worse.
-    _executor_pool = ProcessPoolExecutor(max_workers=4, initializer=_init_pool_worker)
+    _executor_pool = _start_save_pool()
 
     # SIGINT preempts the current rollout instead of ending the session -- and stays safe when it is
     # pressed repeatedly, which is exactly what a user does when the arm keeps moving through the

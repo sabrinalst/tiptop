@@ -328,6 +328,31 @@ A Rerun window will open automatically. Check that:
 
 Press {kbd}`Ctrl+C` in the terminal to exit.
 
+### viz-mutual-pose and viz-mutual-result
+
+Check the bimanual YAM's camera calibration by having the arms look at each other. Both commands draw the URDF arm meshes through tiptop's own calibration entries, so a mask that misses the real arm means tiptop's belief about the cameras or the robot is wrong. They are two commands so that the pose is recorded once and replayed on demand.
+
+**Prerequisites:**
+
+- `TIPTOP_CONFIG=tiptop_yam_real.yml` and the arm server running
+- Calibration entries for the cameras you want checked, looked up by serial like a normal run (or pass `--calibration-file`). `scripts/raiden_tiptop_calib_cvt.py` produces them from raiden's calibration. A camera without an entry is skipped with a warning.
+
+**viz-mutual-pose** releases both arms for hand-guiding. Rerun shows every camera's image with both arms' silhouettes projected on it (left blue, right red), and the terminal reports how much of each image each arm covers. `OK` means the camera sees what it needs: a wrist camera the other gripper, the top camera both. Press {kbd}`r` to record the pose, then {kbd}`s` to save and quit, {kbd}`t` to retry, or {kbd}`q` to quit without saving.
+
+**viz-mutual-result** moves the left arm and then the right arm straight to the saved pose, captures one frame per camera, and shows in Rerun the captured images overlaid with the arm masks (`captured/<camera>/overlay`) next to the live point clouds and the robot. Captures are also saved to `<cache>/mutual_view/<timestamp>/`.
+
+```bash
+viz-mutual-pose
+viz-mutual-result
+
+# Test a hypothesis, e.g. a mirrored wrist-roll joint, by flipping joint signs before the URDF FK
+viz-mutual-pose --joint-signs "1 1 1 1 1 -1"
+```
+
+```{warning}
+`viz-mutual-result` moves the arms one at a time. Clear the workspace first and keep a hand near the e-stop.
+```
+
 ```{tip}
 Move the robot around (in Programming mode) while this is running to see the point cloud update in real-time and verify calibration across different poses.
 ```

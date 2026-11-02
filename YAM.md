@@ -39,10 +39,11 @@ Then add the fixed camera's extrinsics. `cameras.hand.mount: world` means its ca
 { "254622075770": { "pose": [x, y, z, roll, pitch, yaw] } }
 ```
 
-The frame is the URDF's `world` link (`cuTAMP/cutamp/robots/assets/yam_description/bimanual_yam.urdf`):
-the base column is mounted at `(0.24, 0, 0.0551)` relative to it, with the left arm at `y = +0.24` and
-the right at `y = -0.24`. So **world origin is 0.24 m in −x from the base column and 0.0551 m below
-its mounting face**, +y toward the left arm. That is also the frame `robot.base_y` splits objects in.
+The frame is the URDF's `world` link (`cuTAMP/cutamp/robots/assets/yam_description/bimanual_yam.urdf`),
+with the arms placed from raiden's calibration (`yam_description/rig.json`, made by
+`scripts/make_rig_geometry.py`): **the origin is midway between the two arm bases**, x forward, +y toward
+the left arm (left base at `y = +0.263`, right at `y = -0.263`), and 0.0451 m below the underside of the
+bases. That is also the frame `robot.base_y` splits objects in, so the midline is exactly `y = 0`.
 
 ### Measuring it: `calibrate-top-cam`
 
@@ -64,6 +65,14 @@ pixi run calibrate-top-cam --mode aim
 # 3. Calibrate. It aims itself first, and the right arm gets parked for you.
 DC_WORKSPACE=prism pixi run calibrate-top-cam --arm left --close-gripper
 ```
+
+**Live view.** Every mode streams the top camera to the Rerun web viewer, with the detected corners
+and the capture verdict (corners, incidence, coverage → GOOD or what is wrong) drawn on, from the
+moment the camera opens. It uses the same ports as the `tiptop-run` setup below (9090 web, 9876
+gRPC): if that Rerun server is already running it streams there, otherwise it starts its own, bound
+to localhost. Either way the same `ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876` tunnel
+reaches it; the URL and tunnel command are logged at startup. `--mode static` waits for Enter before
+capturing so there is time to check the view. `--no-live-view` turns it off.
 
 **Aiming is automatic.** The board only has to be clamped in and roughly visible — the arm turns the
 wrist until it faces the camera before capturing anything. Three numbers are reported per step:
@@ -168,8 +177,8 @@ ip -br link show type can          # expect can_left UP, can_right UP
 
 # 3. Perception servers (as for any tiptop run). Both are pixi projects on this workstation --
 #    build once with ./build_server.sh, which compiles CUDA kernels and takes a while.
-(cd ../M2T2 && pixi run python server.py --port 8123 &)
-(cd ../FoundationStereo && pixi run python server.py --port 8124 \
+(cd M2T2 && pixi run python server.py --port 8123 &)
+(cd FoundationStereo && pixi run python server.py --port 8124 \
      --ckpt-dir pretrained_models/<run>/model_best_bp2.pth &)
 
 # 4. Collect — from the data-collection UI, picking a config with `embodiment: bimanual_yam`
@@ -177,6 +186,63 @@ ip -br link show type can          # expect can_left UP, can_right UP
 TIPTOP_CONFIG=tiptop_yam_real.yml pixi run tiptop-run \
     --output-dir ../data-collection/runs/<workspace>/tamp/yam_toys --enable-recording
 ```
+
+### Copy/paste: `yam_toys` over SSH with the Rerun web viewer
+
+Plain SSH does not forward Rerun automatically. Keep three terminals open: one **local** SSH tunnel
+and two **remote** terminals (Rerun server and TiPToP). Start them in this order.
+
+On the **local computer**, forward both the web-viewer and gRPC ports (replace `<host>`):
+
+```bash
+ssh -N \
+  -L 9090:127.0.0.1:9090 \
+  -L 9876:127.0.0.1:9876 \
+  prism-yam@<host>
+```
+
+On the **robot workstation**, start the Rerun web/gRPC server and leave it running:
+
+```bash
+cd /mnt/prpl-data/tamp-vla/tiptop
+pixi run rerun \
+  --serve-web \
+  --bind 127.0.0.1 \
+  --web-viewer-port 9090 \
+  --port 9876 \
+  --server-memory-limit 4GB
+```
+
+In a second terminal on the **robot workstation**, start `yam_toys`:
+
+```bash
+cd /mnt/prpl-data/tamp-vla/tiptop
+
+TIPTOP_RERUN_CONNECT_URL=rerun+http://127.0.0.1:9876/proxy \
+TIPTOP_RERUN_WEB_PORT=9090 \
+TIPTOP_FS_PORT=8124 \
+DC_WORKSPACE=prism \
+TIPTOP_CONFIG=tiptop_yam_real.yml \
+TIPTOP_CONFIG_ID=tamp/yam_toys \
+TIPTOP_TASK="Pick up the bananas and put them in the bowl." \
+pixi run tiptop-run \
+  --output-dir /mnt/prpl-data/tamp-vla/data-collection/runs/prism/tamp/yam_toys \
+  --enable-recording \
+  --cutamp-visualize \
+  --curobo-overrides '{"num_particles":512,"opt_steps_per_skeleton":500,"time_dilation_factor_literal":0.3}'
+```
+
+When planning begins, the TiPToP log prints the complete viewer URL. Open that URL on the local
+computer; it includes the required `?url=...` connection parameter. It currently looks like:
+
+```text
+http://localhost:9090?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy
+```
+
+Opening only `http://localhost:9090` may show an unconnected welcome screen. Each arm also saves an
+offline fallback at `<rollout>/<left|right>/cutamp/cutamp.rrd`; copy it locally and run
+`rerun cutamp.rrd` if the web viewer is unavailable. At the task prompt, bare Enter repeats the
+task only after the first task exists, and `q` ends the warmed session.
 
 Both arms' cuRobo solvers warm up front, so the first rollout costs roughly twice a single-arm warmup
 and no rollout pays a warmup mid-episode.
@@ -209,7 +275,10 @@ and no rollout pays a warmup mid-episode.
   Outside a session, `pixi run go-home-yam` does the same from a shell (and `pixi run
   gripper-open-yam` opens the jaws); both take `--arm left|right|both`, default `both`, and select
   `tiptop_yam_real.yml` unless `TIPTOP_CONFIG` already names a config. They only need the arm server
-  — no perception servers, no cameras.
+  — no perception servers, no cameras. `go-home-yam --zero` sends the arms to the zero (resting)
+  posture instead of neutral (`--neutral`, the default). Zero has joints 2 and 3 on their lower limits,
+  which cuRobo rejects, so that move — and a neutral move that starts from rest — goes straight through
+  the arm server with no collision checking; keep the workspace clear.
 
 ## Troubleshooting
 

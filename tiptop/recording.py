@@ -231,13 +231,18 @@ def record_cameras(recordings: list[tuple[object, Path, Path | None]]) -> Genera
                     try:
                         w.write(first)
                         while not event.is_set():
-                            w.write(cam.read_camera().rgb)
+                            rgb = cam.read_camera().rgb
+                            # A read can block for a long reconnect; the recording may have ended (and
+                            # its file closed) by the time it returns.
+                            if event.is_set():
+                                break
+                            w.write(rgb)
                     except Exception as e:
                         _log.error(f"Error recording camera {cam.serial}: {e}")
 
                 _log.info(f"Started recording camera {camera.serial} to {mp4_path} ({width}x{height})")
 
-            thread = threading.Thread(target=recording_loop, name=f"record-{camera.serial}")
+            thread = threading.Thread(target=recording_loop, name=f"record-{camera.serial}", daemon=True)
             thread.start()
             started.append((camera, svo_path, mp4_path, stop_event, thread))
     except BaseException:
